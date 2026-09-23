@@ -556,7 +556,7 @@ switch ($Action) {
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
         if ($null -eq $wb) { Output-Json @{ success = $false; error = "No active workbook" }; exit }
-        $sheet = if ($p.sheet -is [int]) { $wb.Sheets.Item($p.sheet) } else { $wb.Sheets.Item($p.sheet) }
+        if ($p.sheet) { $sheet = $wb.Sheets.Item($p.sheet) } else { $sheet = $wb.ActiveSheet }
         $cell = $sheet.Cells.Item($p.row, $p.col)
         Output-Json @{ success = $true; data = @{ value = $cell.Value2; text = $cell.Text; formula = $cell.Formula } }
     }
@@ -565,7 +565,7 @@ switch ($Action) {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
-        $sheet = if ($p.sheet -is [int]) { $wb.Sheets.Item($p.sheet) } else { $wb.Sheets.Item($p.sheet) }
+        if ($p.sheet) { $sheet = $wb.Sheets.Item($p.sheet) } else { $sheet = $wb.ActiveSheet }
         $sheet.Cells.Item($p.row, $p.col).Value2 = $p.value
         Output-Json @{ success = $true }
     }
@@ -574,7 +574,7 @@ switch ($Action) {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
-        $sheet = if ($p.sheet -is [int]) { $wb.Sheets.Item($p.sheet) } else { $wb.Sheets.Item($p.sheet) }
+        if ($p.sheet) { $sheet = $wb.Sheets.Item($p.sheet) } else { $sheet = $wb.ActiveSheet }
         $range = $sheet.Range($p.range)
         $data = @()
         for ($r = 1; $r -le $range.Rows.Count; $r++) {
@@ -589,7 +589,7 @@ switch ($Action) {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
-        $sheet = if ($p.sheet -is [int]) { $wb.Sheets.Item($p.sheet) } else { $wb.Sheets.Item($p.sheet) }
+        if ($p.sheet) { $sheet = $wb.Sheets.Item($p.sheet) } else { $sheet = $wb.ActiveSheet }
         $range = $sheet.Range($p.range)
         for ($r = 0; $r -lt $p.data.Count; $r++) {
             for ($c = 0; $c -lt $p.data[$r].Count; $c++) { $range.Cells.Item($r + 1, $c + 1).Value2 = $p.data[$r][$c] }
@@ -637,7 +637,7 @@ switch ($Action) {
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
         if ($null -eq $wb) { Output-Json @{ success = $false; error = "No active workbook" }; exit }
-        $sheet = if ($p.sheet -is [int]) { $wb.Sheets.Item($p.sheet) } else { $wb.Sheets.Item($p.sheet) }
+        if ($p.sheet) { $sheet = $wb.Sheets.Item($p.sheet) } else { $sheet = $wb.ActiveSheet }
         $range = $sheet.Range($p.range)
         $opsResult = @()
         foreach ($op in $p.operations) {
@@ -809,7 +809,7 @@ switch ($Action) {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
-        $sheet = if ($p.sheet -is [int]) { $wb.Sheets.Item($p.sheet) } else { $wb.Sheets.Item($p.sheet) }
+        if ($p.sheet) { $sheet = $wb.Sheets.Item($p.sheet) } else { $sheet = $wb.ActiveSheet }
         if ($p.range) { $range = $sheet.Range($p.range) } else { $range = $sheet.Cells.Item($p.row, $p.col)}
         $range.Formula = $p.formula
         Output-Json @{ success = $true }

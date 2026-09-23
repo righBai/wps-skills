@@ -80,6 +80,44 @@ export function getPptTarget(): string | undefined {
 /**
  * 执行PowerShell命令 (Windows)
  */
+/** 从后往前找第一行可解析的 JSON；都不行返回 undefined */
+function parseLastJsonLine(stdout: string): unknown {
+  const trimmed = stdout.trim();
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    // 继续逐行尝试
+  }
+  const lines = trimmed.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line.startsWith('{')) continue;
+    try {
+      return JSON.parse(line);
+    } catch {
+      // 继续向前
+    }
+  }
+  return undefined;
+}
+
+/** 提取 PowerShell 错误记录的消息行，去掉位置/分类等噪声；无错误返回空串 */
+function extractPsErrors(stderr: string): string {
+  if (stderr.trimStart().startsWith('#< CLIXML')) {
+    // CLIXML 里可能只有进度记录，只取 S="Error" 的条目
+    const errs = Array.from(stderr.matchAll(/<S S="Error">([\s\S]*?)<\/S>/g), (m) =>
+      m[1].replace(/_x000D__x000A_/g, ' ').trim()
+    ).filter(Boolean);
+    return Array.from(new Set(errs)).join('; ').substring(0, 500);
+  }
+  const noise = /^(At |所在位置|\+|~|CategoryInfo|FullyQualifiedErrorId)/;
+  const messages = stderr
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l && !noise.test(l));
+  return Array.from(new Set(messages)).join('; ').substring(0, 500);
+}
+
 async function execPowerShell(action: string, params: Record<string, unknown> = {}): Promise<unknown> {
   return new Promise((resolve, reject) => {
     // JSON参数通过spawn args数组传递，Node自动处理Windows引号转义
@@ -134,13 +172,27 @@ async function execPowerShell(action: string, params: Record<string, unknown> = 
         return;
       }
 
-      try {
-        const result = JSON.parse(stdout.trim());
-        resolve(result);
-      } catch (_e) {
+      // Output-Json 总是最后一行；COM 方法的返回值（如 True）可能泄漏到前面的行
+      const result = parseLastJsonLine(stdout);
+      if (result === undefined) {
         log.error('Failed to parse PowerShell output', { stdout: stdout.substring(0, 200), pid: ps.pid, action });
         reject(new Error(`PowerShell 输出解析失败（非有效JSON）: ${stdout.substring(0, 200)}`));
+        return;
       }
+
+      // 未被 try/catch 捕获的 COM 错误是非终止错误：脚本继续执行并输出 success:true，
+      // 错误只出现在 stderr。此时以 stderr 为准判定失败，避免"假成功"
+      const errText = extractPsErrors(stderr);
+      if (errText && result && typeof result === 'object' && (result as { success?: unknown }).success === true) {
+        log.warn('PowerShell reported success but wrote errors to stderr', { action, pid: ps.pid, stderr: stderr.substring(0, 500) });
+        resolve({
+          ...(result as Record<string, unknown>),
+          success: false,
+          error: `执行过程中出错（部分步骤可能已生效）: ${errText}`,
+        });
+        return;
+      }
+      resolve(result);
     });
 
     ps.on('error', (err) => {
