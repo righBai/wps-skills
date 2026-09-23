@@ -810,7 +810,7 @@ switch ($Action) {
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
         $sheet = if ($p.sheet -is [int]) { $wb.Sheets.Item($p.sheet) } else { $wb.Sheets.Item($p.sheet) }
-        $range = if ($p.range) { $sheet.Range($p.range) } else { $sheet.Cells.Item($p.row, $p.col) }
+        if ($p.range) { $range = $sheet.Range($p.range) } else { $range = $sheet.Cells.Item($p.row, $p.col)}
         $range.Formula = $p.formula
         Output-Json @{ success = $true }
     }
@@ -1475,7 +1475,7 @@ switch ($Action) {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $sheet = $excel.ActiveSheet
-        $range = if ($p.range) { $sheet.Range($p.range) } else { $sheet.UsedRange }
+        if ($p.range) { $range = $sheet.Range($p.range) } else { $range = $sheet.UsedRange}
         $range.Columns.AutoFit()
         $range.Rows.AutoFit()
         Output-Json @{ success = $true; data = @{ message = "列宽行高已自动调整" } }
@@ -1520,13 +1520,13 @@ switch ($Action) {
     "clearRange" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        if ($p.sheet) { $sheet = $excel.ActiveWorkbook.Sheets.Item($p.sheet) } else { $sheet = $excel.ActiveSheet }
         $range = $sheet.Range($p.range)
         $clearType = if ($p.type) { $p.type } else { "all" }
-        if ($clearType -eq "contents") { $range.ClearContents() }
-        elseif ($clearType -eq "formats") { $range.ClearFormats() }
-        elseif ($clearType -eq "comments") { $range.ClearComments() }
-        else { $range.Clear() }
+        if ($clearType -eq "contents") { [void]$range.ClearContents() }
+        elseif ($clearType -eq "formats") { [void]$range.ClearFormats() }
+        elseif ($clearType -eq "comments") { [void]$range.ClearComments() }
+        else { [void]$range.Clear() }
         Output-Json @{ success = $true; data = @{ range = $p.range; clearType = $clearType } }
     }
 
@@ -1682,7 +1682,7 @@ switch ($Action) {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $sheet = $excel.ActiveSheet
-        $searchRange = if ($p.range) { $sheet.Range($p.range) } else { $sheet.UsedRange }
+        if ($p.range) { $searchRange = $sheet.Range($p.range) } else { $searchRange = $sheet.UsedRange}
         $results = @()
         $lookAt = if ($p.matchCase) { 1 } else { 2 }
         $found = $searchRange.Find($p.searchText, $null, -4163, $lookAt)
@@ -1703,7 +1703,7 @@ switch ($Action) {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $sheet = $excel.ActiveSheet
-        $searchRange = if ($p.range) { $sheet.Range($p.range) } else { $sheet.UsedRange }
+        if ($p.range) { $searchRange = $sheet.Range($p.range) } else { $searchRange = $sheet.UsedRange}
         $lookAt = if ($p.matchCase) { 1 } else { 2 }
         $replaced = $searchRange.Replace($p.searchText, $p.replaceText, $lookAt)
         Output-Json @{ success = $true; data = @{ searchText = $p.searchText; replaceText = $p.replaceText; success = $replaced } }

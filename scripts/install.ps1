@@ -141,7 +141,10 @@ function Test-WpsInstallation {
         "${env:LOCALAPPDATA}\Kingsoft\WPS Office\ksolaunch.exe",
         # 新版WPS可能在这些路径
         "${env:ProgramFiles}\Kingsoft\WPS Office\office6\wps.exe",
-        "${env:ProgramFiles(x86)}\Kingsoft\WPS Office\office6\wps.exe"
+        "${env:ProgramFiles(x86)}\Kingsoft\WPS Office\office6\wps.exe",
+        # WPS 12.x 默认安装路径
+        "${env:ProgramFiles}\Kingsoft Office Software\WPS Office\ksolaunch.exe",
+        "${env:ProgramFiles(x86)}\Kingsoft Office Software\WPS Office\ksolaunch.exe"
     )
 
     foreach ($path in $wpsPaths) {
@@ -168,6 +171,12 @@ function Test-WpsInstallation {
         }
     }
     catch {}
+
+    # 兜底：COM 组件已注册即可用（MCP 在 Windows 上依赖的正是 COM）
+    if (Test-Path "Registry::HKEY_CLASSES_ROOT\Ket.Application\CLSID") {
+        Write-Success "✓ WPS Office 已安装（检测到 COM 组件 Ket.Application）"
+        return $true
+    }
 
     Write-Warn "⚠ 未检测到 WPS Office 安装"
     Write-Warn "  请确保已安装 WPS Office 2019 或更高版本"
