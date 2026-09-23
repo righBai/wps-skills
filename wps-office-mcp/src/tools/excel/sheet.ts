@@ -67,9 +67,10 @@ export const createSheetHandler: ToolHandler = async (
   };
 
   try {
+    // 两个后端均返回 sheetName 与从 1 开始的 sheetIndex
     const response = await wpsClient.executeMethod<{
-      name: string;
-      index: number;
+      sheetName: string;
+      sheetIndex: number;
     }>(
       'createSheet',
       { name, position },
@@ -91,7 +92,7 @@ export const createSheetHandler: ToolHandler = async (
       content: [
         {
           type: 'text',
-          text: `工作表创建成功！\n名称: ${response.data.name}\n位置: 第${response.data.index + 1}个`,
+          text: `工作表创建成功！\n名称: ${response.data.sheetName}\n位置: 第${response.data.sheetIndex}个`,
         },
       ],
     };
