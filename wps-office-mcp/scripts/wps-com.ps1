@@ -20,7 +20,7 @@ function Get-WpsExcel {
     catch {
         try {
             $app = New-Object -ComObject 'Ket.Application'
-            if ($app) { return $app }
+            if ($app) { try { $app.Visible = $true } catch {}; return $app }
         } catch {
             try {
                 $clsid = (Get-ItemProperty -Path 'HKCU:\Software\Classes\Ket.Application\CLSID' -ErrorAction Stop).'(default)'
@@ -28,7 +28,7 @@ function Get-WpsExcel {
                     $type = [Type]::GetTypeFromCLSID($clsid)
                     if ($type) {
                         $app = [Activator]::CreateInstance($type)
-                        if ($app) { return $app }
+                        if ($app) { try { $app.Visible = $true } catch {}; return $app }
                     }
                 }
             } catch {}
@@ -42,7 +42,7 @@ function Get-WpsWord {
     catch {
         try {
             $app = New-Object -ComObject 'Kwps.Application'
-            if ($app) { return $app }
+            if ($app) { try { $app.Visible = $true } catch {}; return $app }
         } catch {
             try {
                 $clsid = (Get-ItemProperty -Path 'HKCU:\Software\Classes\Kwps.Application\CLSID' -ErrorAction Stop).'(default)'
@@ -50,7 +50,7 @@ function Get-WpsWord {
                     $type = [Type]::GetTypeFromCLSID($clsid)
                     if ($type) {
                         $app = [Activator]::CreateInstance($type)
-                        if ($app) { return $app }
+                        if ($app) { try { $app.Visible = $true } catch {}; return $app }
                     }
                 }
             } catch {}
@@ -229,12 +229,96 @@ function Write-Grid($anchor, $data) {
     $anchor.Cells.Item(1, 1).Resize($rows, $cols).Value2 = $grid
 }
 
+# COM 对错误单元格的 Value2 返回 Int32 错误码（数值单元格是 Double），转成 #DIV/0! 等文本
+$script:CellErrorMap = @{ -2146826288 = "#NULL!"; -2146826281 = "#DIV/0!"; -2146826273 = "#VALUE!"; -2146826265 = "#REF!"; -2146826259 = "#NAME?"; -2146826252 = "#NUM!"; -2146826246 = "#N/A" }
+function Convert-CellError($v) {
+    if ($v -is [int] -and $script:CellErrorMap.ContainsKey($v)) { return $script:CellErrorMap[$v] }
+    return $v
+}
+
+# 删除重复行，返回删除的行数。$cols 为区域内列序号（缺省为全部列），$hasHeader 为 bool
+function Remove-DuplicateRows($excel, $range, $cols, [bool]$hasHeader) {
+    if ($null -eq $cols -or @($cols).Count -eq 0) { $cols = @(1..$range.Columns.Count) }
+    # 必须是 object[]：int[] 在 WPS 下报"值不在预期的范围内"
+    $colArr = [object[]]@($cols | ForEach-Object { [int]$_ })
+    $firstCol = $range.Columns.Item(1)
+    $before = $excel.WorksheetFunction.CountA($firstCol)
+    try {
+        [void]$range.RemoveDuplicates($colArr, $(if ($hasHeader) { 1 } else { 2 }))
+    } catch {
+        if ($_.Exception.HResult -eq [int]0x8FE30C07) { throw "WPS 不允许在含分组（大纲）行的区域删除重复项，请先取消分组后重试" }
+        throw
+    }
+    return $before - $excel.WorksheetFunction.CountA($firstCol)
+}
+
+# 按 $p.sheet 取工作表，缺省为活动表；表名不存在时 Item 抛错，由 bridge 判为失败
+function Get-TargetSheet($excel, $p) {
+    if ($p.sheet) { return $excel.ActiveWorkbook.Sheets.Item($p.sheet) }
+    return $excel.ActiveSheet
+}
+
+# 整行/整列插入删除：关闭告警避免冲突弹窗卡死调用；WPS 在冲突时会静默取消插入，
+# 所以插入后按已用区域末行/末列校验是否真的平移了。成功返回 $null，失败返回原因
+function Invoke-ShiftLines($excel, $sheet, [string]$axis, [int]$start, [int]$count, [bool]$isInsert, [scriptblock]$op) {
+    $ur = $sheet.UsedRange
+    $lastOf = { param($u) if ($axis -eq 'row') { $u.Row + $u.Rows.Count - 1 } else { $u.Column + $u.Columns.Count - 1 } }
+    $before = & $lastOf $ur
+    # 起始行/列到末行/列之间有内容，插入后末行/列才必然后移（空表的 UsedRange 恒为 A1）
+    $hasTail = $false
+    if ($start -le $before) {
+        if ($axis -eq 'row') { $tail = $sheet.Range($sheet.Cells.Item($start, 1), $sheet.Cells.Item($before, 1)).EntireRow }
+        else { $tail = $sheet.Range($sheet.Cells.Item(1, $start), $sheet.Cells.Item(1, $before)).EntireColumn }
+        $hasTail = $excel.WorksheetFunction.CountA($tail) -gt 0
+    }
+    # 找与受影响区域相交的透视表，冲突时点名提示
+    $hits = @()
+    foreach ($pt in $sheet.PivotTables()) {
+        $tr = $pt.TableRange2
+        $a = if ($axis -eq 'row') { $tr.Row } else { $tr.Column }
+        $b = if ($axis -eq 'row') { $tr.Row + $tr.Rows.Count - 1 } else { $tr.Column + $tr.Columns.Count - 1 }
+        $end = if ($isInsert) { [int]::MaxValue } else { $start + $count - 1 }
+        if ($b -ge $start -and $a -le $end) { $hits += "$($pt.Name)($($tr.Address($false, $false)))" }
+    }
+    $hint = if ($hits.Count) { "，与透视表冲突: $($hits -join ', ')" } else { "，可能与透视表、合并单元格或数组公式冲突" }
+    $old = $excel.DisplayAlerts
+    $excel.DisplayAlerts = $false
+    try { & $op }
+    catch { return "WPS 拒绝了该操作$hint（$($_.Exception.Message)）" }
+    finally { $excel.DisplayAlerts = $old }
+    $after = & $lastOf $sheet.UsedRange
+    if ($isInsert) {
+        if ($hasTail -and $after -ne $before + $count) { return "插入未生效$hint" }
+        return $null
+    }
+    # 删除：其后还有内容时末行/列应前移 count；删的是尾部时该区域应已清空
+    $end = $start + $count - 1
+    if ($before -gt $end) {
+        if ($after -ne $before - $count) { return "删除未生效$hint" }
+    } else {
+        # 分支内赋值：$x = if(){Range} 会把多格 Range 展开成数组
+        if ($axis -eq 'row') { $block = $sheet.Range($sheet.Cells.Item($start, 1), $sheet.Cells.Item($end, 1)).EntireRow }
+        else { $block = $sheet.Range($sheet.Cells.Item(1, $start), $sheet.Cells.Item(1, $end)).EntireColumn }
+        if ($excel.WorksheetFunction.CountA($block) -gt 0) { return "删除未生效$hint" }
+    }
+    return $null
+}
+
+# 列参数可为列号或字母，统一转成字母
+function Resolve-ColumnLetter($col) {
+    if ($null -eq $col) { return $null }
+    $s = [string]$col
+    if ($s -match '^\d+$') { return Convert-ColumnNumberToLetter([int]$s) }
+    return $s.ToUpper()
+}
+
+# 用 return , 防止 PowerShell 把多单元格 Range 展开成数组
 function Get-RangeFromAddress($workbook, [string]$address) {
     if ($address -match "^(?<sheet>[^!]+)!(?<range>.+)$") {
         $sheetName = $matches.sheet.Trim("'")
-        return $workbook.Sheets.Item($sheetName).Range($matches.range)
+        return ,$workbook.Sheets.Item($sheetName).Range($matches.range)
     }
-    return $workbook.ActiveSheet.Range($address)
+    return ,$workbook.ActiveSheet.Range($address)
 }
 
 function Get-AppTypeByExtension([string]$filePath) {
@@ -574,7 +658,7 @@ switch ($Action) {
         if ($null -eq $wb) { Output-Json @{ success = $false; error = "No active workbook" }; exit }
         if ($p.sheet) { $sheet = $wb.Sheets.Item($p.sheet) } else { $sheet = $wb.ActiveSheet }
         $cell = $sheet.Cells.Item($p.row, $p.col)
-        Output-Json @{ success = $true; data = @{ value = $cell.Value2; text = $cell.Text; formula = $cell.Formula } }
+        Output-Json @{ success = $true; data = @{ value = (Convert-CellError $cell.Value2); text = $cell.Text; formula = $cell.Formula } }
     }
 
     "setCellValue" {
@@ -592,11 +676,20 @@ switch ($Action) {
         $wb = $excel.ActiveWorkbook
         if ($p.sheet) { $sheet = $wb.Sheets.Item($p.sheet) } else { $sheet = $wb.ActiveSheet }
         $range = $sheet.Range($p.range)
+        # 一次取回 Value2 二维数组，避免逐格跨进程调用
+        $vals = $range.Value2
+        $rows = $range.Rows.Count
+        $cols = $range.Columns.Count
         $data = @()
-        for ($r = 1; $r -le $range.Rows.Count; $r++) {
-            $row = @()
-            for ($c = 1; $c -le $range.Columns.Count; $c++) { $row += $range.Cells.Item($r, $c).Value2 }
-            $data += ,@($row)
+        if ($rows -eq 1 -and $cols -eq 1) {
+            $data += ,@(Convert-CellError $vals)
+        } else {
+            $lr = $vals.GetLowerBound(0); $lc = $vals.GetLowerBound(1)
+            for ($r = 0; $r -lt $rows; $r++) {
+                $row = @()
+                for ($c = 0; $c -lt $cols; $c++) { $row += Convert-CellError $vals[($lr + $r), ($lc + $c)] }
+                $data += ,@($row)
+            }
         }
         Output-Json @{ success = $true; data = @{ data = $data } }
     }
@@ -615,9 +708,9 @@ switch ($Action) {
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
         if ($null -eq $wb) { Output-Json @{ success = $false; error = "No active workbook" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $cell = $sheet.Range($p.cell)
-        $value = $cell.Value2
+        $value = Convert-CellError $cell.Value2
         $formula = $cell.Formula
         $errorType = $null
         $diagnosis = ""
@@ -656,43 +749,57 @@ switch ($Action) {
         foreach ($op in $p.operations) {
             $success = $true
             $message = ""
-            switch ($op) {
-                "trim" {
-                    foreach ($cell in $range) {
-                        if ($cell.Value2 -is [string]) { $cell.Value2 = $cell.Value2.Trim() }
+            # 每个操作独立捕获，避免一个失败让已执行的操作结果无从得知
+            try {
+                switch ($op) {
+                    "trim" {
+                        $n = 0
+                        foreach ($cell in $range.Cells) {
+                            $v = $cell.Value2
+                            if ($v -is [string] -and $v -ne $v.Trim()) { $cell.Value2 = $v.Trim(); $n++ }
+                        }
+                        $message = "已去除 $n 个单元格的前后空格"
                     }
-                    $message = "已去除前后空格"
-                }
-                "remove_duplicates" {
-                    $colCount = $range.Columns.Count
-                    $cols = @()
-                    for ($i = 1; $i -le $colCount; $i++) { $cols += $i }
-                    $range.RemoveDuplicates($cols, 1)
-                    $message = "已删除重复行"
-                }
-                "unify_date" {
-                    foreach ($cell in $range) {
-                        try {
-                            if ($cell.Value2) {
-                                $dt = [DateTime]::FromOADate($cell.Value2)
-                                $cell.Value2 = $dt.ToString("yyyy-MM-dd")
+                    "remove_duplicates" {
+                        $removed = Remove-DuplicateRows $excel $range $null $true
+                        $message = "已删除 $removed 行重复数据"
+                    }
+                    "unify_date" {
+                        # 只处理日期格式的数值和可解析为日期的文本，普通数字不动
+                        $n = 0
+                        foreach ($cell in $range.Cells) {
+                            $v = $cell.Value2
+                            $dt = $null
+                            if ($v -is [double] -and ([string]$cell.NumberFormat) -match '[yd]') { $dt = [DateTime]::FromOADate($v) }
+                            elseif ($v -is [string]) {
+                                $parsed = [DateTime]::MinValue
+                                if ([DateTime]::TryParse($v.Trim(), [ref]$parsed)) { $dt = $parsed }
                             }
-                        } catch {}
+                            if ($null -ne $dt) { $cell.NumberFormat = "yyyy-mm-dd"; $cell.Value2 = $dt.ToOADate(); $n++ }
+                        }
+                        $message = "已统一 $n 个日期单元格为 yyyy-mm-dd"
                     }
-                    $message = "已统一日期格式"
-                }
-                "remove_empty_rows" {
-                    for ($i = $range.Rows.Count; $i -ge 1; $i--) {
-                        $row = $range.Rows.Item($i)
-                        $isEmpty = $true
-                        foreach ($cell in $row.Cells) { if ($cell.Value2) { $isEmpty = $false; break } }
-                        if ($isEmpty) { $row.Delete() }
+                    "remove_empty_rows" {
+                        $n = 0
+                        for ($i = $range.Rows.Count; $i -ge 1; $i--) {
+                            $row = $range.Rows.Item($i)
+                            if ($excel.WorksheetFunction.CountA($row) -eq 0) { [void]$row.EntireRow.Delete(); $n++ }
+                        }
+                        $message = "已删除 $n 个空行"
                     }
-                    $message = "已删除空行"
+                    default { $success = $false; $message = "不支持的操作（可选 trim/remove_duplicates/unify_date/remove_empty_rows）" }
                 }
-                default { $success = $false; $message = "不支持的操作" }
+            } catch {
+                $success = $false
+                $message = $_.Exception.Message
             }
             $opsResult += @{ operation = $op; success = $success; message = $message }
+        }
+        $failed = @($opsResult | Where-Object { -not $_.success })
+        if ($failed.Count -gt 0) {
+            $detail = ($opsResult | ForEach-Object { "$($_.operation): $(if ($_.success) { '成功' } else { '失败' }) - $($_.message)" }) -join "；"
+            Output-Json @{ success = $false; error = "部分清洗操作失败：$detail"; data = @{ range = $p.range; operations = $opsResult } }
+            exit
         }
         Output-Json @{ success = $true; data = @{ range = $p.range; operations = $opsResult; message = "cleanData completed" } }
     }
@@ -742,7 +849,7 @@ switch ($Action) {
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
         if ($null -eq $wb) { Output-Json @{ success = $false; error = "No active workbook" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $table = $null
         if ($p.pivotTableName) {
             try { $table = $sheet.PivotTables($p.pivotTableName) } catch {}
@@ -825,13 +932,14 @@ switch ($Action) {
         if ($p.sheet) { $sheet = $wb.Sheets.Item($p.sheet) } else { $sheet = $wb.ActiveSheet }
         if ($p.range) { $range = $sheet.Range($p.range) } else { $range = $sheet.Cells.Item($p.row, $p.col)}
         $range.Formula = $p.formula
-        Output-Json @{ success = $true }
+        # 返回首格的显示值，便于调用方确认公式是否算出预期结果
+        Output-Json @{ success = $true; data = @{ value = $range.Cells.Item(1, 1).Text; cells = $range.Count } }
     }
 
     "setCellFormat" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $range = $sheet.Range($p.range)
         if ($p.numberFormat) { $range.NumberFormat = $p.numberFormat }
         Output-Json @{ success = $true; data = @{ range = $p.range; format = $p.numberFormat } }
@@ -840,11 +948,28 @@ switch ($Action) {
     "setCellStyle" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $range = $sheet.Range($p.range)
+        # 内置命名样式（标题、好、差、适中、输入、输出、计算、汇总……）
+        if ($p.style) {
+            $alias = @{ "强调" = "强调文字颜色 1"; "中性" = "适中"; "警告" = "警告文本"; "链接" = "链接单元格" }
+            $names = @($p.style)
+            if ($alias.ContainsKey([string]$p.style)) { $names += $alias[[string]$p.style] }
+            $applied = $false
+            foreach ($n in $names) {
+                try { [void]$excel.ActiveWorkbook.Styles.Item([string]$n); $range.Style = [string]$n; $applied = $true; break } catch {}
+            }
+            if (-not $applied) {
+                $available = @(); foreach ($s in $excel.ActiveWorkbook.Styles) { $available += $s.Name }
+                Output-Json @{ success = $false; error = "样式不存在: $($p.style)。可用: $($available -join '、')" }; exit
+            }
+        }
         if ($p.fontSize) { $range.Font.Size = $p.fontSize }
         if ($null -ne $p.bold) { $range.Font.Bold = [bool]$p.bold }
         if ($null -ne $p.italic) { $range.Font.Italic = [bool]$p.italic }
+        if ($null -ne $p.underline) { $range.Font.Underline = $(if ($p.underline) { 2 } else { -4142 }) }
+        if ($null -ne $p.strikethrough) { $range.Font.Strikethrough = [bool]$p.strikethrough }
+        if ($null -ne $p.wrapText) { $range.WrapText = [bool]$p.wrapText }
         if ($p.fontName) { $range.Font.Name = $p.fontName }
         if ($p.backgroundColor) {
             $bg = Convert-HexColorToRgbInt([string]$p.backgroundColor)
@@ -877,14 +1002,19 @@ switch ($Action) {
     "setBorder" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $range = $sheet.Range($p.range)
-        $styleMap = @{ thin = 1; medium = 2; thick = 4; double = 6; none = 0 }
-        $style = $styleMap[$p.style]
-        if ($null -eq $style) { $style = 1 }
+        # Weight: xlHairline=1 xlThin=2 xlMedium=-4138 xlThick=4；double 是 LineStyle(xlDouble=-4119)
+        $styleName = if ($p.style) { ([string]$p.style).ToLower() } else { "thin" }
+        $weightMap = @{ hairline = 1; thin = 2; medium = -4138; thick = 4; double = 4 }
+        if ($styleName -ne "none" -and -not $weightMap.ContainsKey($styleName)) {
+            Output-Json @{ success = $false; error = "不支持的边框样式: $styleName（可选 thin/medium/thick/double/hairline/none）" }; exit
+        }
+        $style = if ($styleName -eq "none") { 0 } else { $weightMap[$styleName] }
+        $lineStyle = if ($styleName -eq "double") { -4119 } else { 1 }
         $position = if ($p.position) { $p.position } else { "all" }
         $borders = @()
-        if ($position -eq "all" -or $position -eq "outside") { $borders += 7, 8, 9, 10 }
+        if ($position -eq "all" -or $position -eq "outside" -or $position -eq "outline") { $borders += 7, 8, 9, 10 }
         if ($position -eq "all" -or $position -eq "inside") { $borders += 11, 12 }
         if ($position -eq "left") { $borders += 7 }
         if ($position -eq "top") { $borders += 8 }
@@ -897,7 +1027,7 @@ switch ($Action) {
             if ($style -eq 0) {
                 $border.LineStyle = -4142
             } else {
-                $border.LineStyle = 1
+                $border.LineStyle = $lineStyle
                 $border.Weight = $style
             }
             if ($null -ne $colorValue) { $border.Color = $colorValue }
@@ -908,7 +1038,7 @@ switch ($Action) {
     "copyFormat" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $sourceRange = $sheet.Range($p.source)
         $targetRange = $sheet.Range($p.target)
         $sourceRange.Copy()
@@ -920,7 +1050,7 @@ switch ($Action) {
     "clearFormats" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $range = $sheet.Range($p.range)
         $range.ClearFormats()
         Output-Json @{ success = $true; data = @{ range = $p.range } }
@@ -961,7 +1091,7 @@ switch ($Action) {
     "removeConditionalFormat" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $range = $sheet.Range($p.range)
         if ($p.index) {
             $range.FormatConditions.Item([int]$p.index).Delete()
@@ -974,7 +1104,7 @@ switch ($Action) {
     "getConditionalFormats" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $range = $sheet.Range($p.range)
         $formats = @()
         $count = $range.FormatConditions.Count
@@ -1033,7 +1163,7 @@ switch ($Action) {
     "removeDataValidation" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $range = $sheet.Range($p.range)
         $range.Validation.Delete()
         Output-Json @{ success = $true; data = @{ range = $p.range } }
@@ -1042,7 +1172,7 @@ switch ($Action) {
     "getDataValidations" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $range = $sheet.Range($p.range)
         $validation = $range.Validation
         Output-Json @{ success = $true; data = @{ range = $p.range; type = $validation.Type; formula1 = $validation.Formula1; formula2 = $validation.Formula2; inputTitle = $validation.InputTitle; inputMessage = $validation.InputMessage } }
@@ -1051,7 +1181,7 @@ switch ($Action) {
     "getFormula" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $cell = $sheet.Range($p.cell)
         $formula = if ($cell.Formula) { $cell.Formula } else { "" }
         $formulaLocal = ""
@@ -1062,7 +1192,7 @@ switch ($Action) {
     "setArrayFormula" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $range = $sheet.Range($p.range)
         $range.FormulaArray = $p.formula
         Output-Json @{ success = $true; data = @{ range = $p.range; formula = $p.formula } }
@@ -1071,7 +1201,7 @@ switch ($Action) {
     "getCellInfo" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $cell = $sheet.Range($p.cell)
         $value = $cell.Value2
         $formula = if ($cell.Formula) { $cell.Formula } else { "" }
@@ -1102,7 +1232,7 @@ switch ($Action) {
     "consolidate" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $destRange = $sheet.Range($p.destination)
         $funcMap = @{ sum = 9; count = 2; average = 1; max = 4; min = 5 }
         $func = $funcMap[$p.function]
@@ -1118,7 +1248,7 @@ switch ($Action) {
             $excel.Calculate()
             Output-Json @{ success = $true; data = @{ calculated = "all" } }
         } else {
-            $sheet = $excel.ActiveSheet
+            $sheet = Get-TargetSheet $excel $p
             $sheet.Calculate()
             Output-Json @{ success = $true; data = @{ calculated = $sheet.Name } }
         }
@@ -1130,7 +1260,7 @@ switch ($Action) {
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
         if ($null -eq $wb) { Output-Json @{ success = $false; error = "No active workbook" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $usedRange = $sheet.UsedRange
         $headers = @()
         if ($usedRange.Rows.Count -gt 0) {
@@ -1151,7 +1281,7 @@ switch ($Action) {
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
         if ($null -eq $wb) { Output-Json @{ success = $false; error = "No active workbook" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $usedRange = $sheet.UsedRange
         $headers = @()
         if ($usedRange.Rows.Count -gt 0) {
@@ -1196,7 +1326,7 @@ switch ($Action) {
     "autoFilter" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $range = $sheet.Range($p.range)
         if ($p.criteria) {
             $range.AutoFilter($p.field, $p.criteria)
@@ -1209,7 +1339,7 @@ switch ($Action) {
     "createChart" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $range = $sheet.Range($p.dataRange)
         $chartType = $p.chartType
         if ($null -eq $chartType) {
@@ -1319,12 +1449,19 @@ switch ($Action) {
         # xlScreen=1 (Appearance), xlBitmap=2 (Format)
         $tempChart = $null
         try {
-            $range.CopyPicture(1, 2)
+            [void]$range.CopyPicture(1, 2)
             $tempChart = $sheet.ChartObjects().Add(0, 0, $range.Width, $range.Height)
-            $tempChart.Activate()
-            $tempChart.Chart.Paste()
-            $tempChart.Chart.Export($outputPath, $filterName)
-            $tempChart.Delete()
+            [void]$tempChart.Activate()
+            # CopyPicture 写剪贴板是异步的，立即 Paste 会偶发 E_ACCESSDENIED，退避重试
+            for ($i = 1; ; $i++) {
+                try { [void]$tempChart.Chart.Paste(); break }
+                catch {
+                    if ($i -ge 8) { throw "剪贴板被占用，粘贴图片失败（已重试 $i 次）: $($_.Exception.Message)" }
+                    Start-Sleep -Milliseconds (200 * $i)
+                }
+            }
+            [void]$tempChart.Chart.Export($outputPath, $filterName)
+            [void]$tempChart.Delete()
             $tempChart = $null
             Output-Json @{ success = $true; data = @{ range = $p.range; outputPath = $outputPath; format = $filterName } }
         } catch {
@@ -1337,7 +1474,7 @@ switch ($Action) {
     "removeDuplicates" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $range = $sheet.Range($p.range)
         $originalCount = $range.Rows.Count
         $cols = @()
@@ -1350,12 +1487,10 @@ switch ($Action) {
                 }
             }
         }
-        if ($cols.Count -eq 0) { $cols = @(1) }
-        $hasHeader = if ($null -ne $p.hasHeader) { [int]([bool]$p.hasHeader) } else { 1 }
-        $range.RemoveDuplicates($cols, $hasHeader)
-        $remainingCount = $range.Rows.Count
-        $removedCount = $originalCount - $remainingCount
-        Output-Json @{ success = $true; data = @{ originalCount = $originalCount; removedCount = $removedCount; remainingCount = $remainingCount } }
+        # 未指定列时按全部列判重（只按第 1 列会误删同类的不同记录）
+        $hasHeader = if ($null -ne $p.hasHeader) { [bool]$p.hasHeader } else { $true }
+        $removedCount = Remove-DuplicateRows $excel $range $cols $hasHeader
+        Output-Json @{ success = $true; data = @{ originalCount = $originalCount; removedCount = $removedCount; remainingCount = $originalCount - $removedCount } }
     }
 
     "createSheet" {
@@ -1382,7 +1517,7 @@ switch ($Action) {
         $sheet = if ($p.sheet) { $wb.Sheets.Item($p.sheet) } else { $excel.ActiveSheet }
         $name = $sheet.Name
         $excel.DisplayAlerts = $false
-        $sheet.Delete()
+        [void]$sheet.Delete()
         $excel.DisplayAlerts = $true
         Output-Json @{ success = $true; data = @{ deletedSheet = $name } }
     }
@@ -1404,14 +1539,22 @@ switch ($Action) {
         $wb = $excel.ActiveWorkbook
         if ($null -eq $wb) { Output-Json @{ success = $false; error = "No active workbook" }; exit }
         $sheet = if ($p.sheet) { $wb.Sheets.Item($p.sheet) } else { $excel.ActiveSheet }
+        $m = [Type]::Missing
+        $cnt = $wb.Sheets.Count
         if ($p.before) {
-            $sheet.Copy($wb.Sheets.Item($p.before))
+            [void]$sheet.Copy($wb.Sheets.Item($p.before))
         } elseif ($p.after) {
-            $sheet.Copy($null, $wb.Sheets.Item($p.after))
+            [void]$sheet.Copy($m, $wb.Sheets.Item($p.after))
+        } elseif ($null -ne $p.position -and [int]$p.position -ge 0 -and [int]$p.position -lt $cnt) {
+            # position 从 0 开始
+            [void]$sheet.Copy($wb.Sheets.Item([int]$p.position + 1))
         } else {
-            $sheet.Copy($null, $wb.Sheets.Item($wb.Sheets.Count))
+            [void]$sheet.Copy($m, $wb.Sheets.Item($cnt))
         }
-        Output-Json @{ success = $true; data = @{ copiedFrom = $sheet.Name } }
+        # Copy 后新表成为活动表
+        $newSheet = $excel.ActiveSheet
+        if ($p.newName) { $newSheet.Name = $p.newName }
+        Output-Json @{ success = $true; data = @{ copiedFrom = $sheet.Name; sourceName = $sheet.Name; newName = $newSheet.Name; index = $newSheet.Index - 1 } }
     }
 
     "getSheetList" {
@@ -1443,18 +1586,30 @@ switch ($Action) {
         $wb = $excel.ActiveWorkbook
         if ($null -eq $wb) { Output-Json @{ success = $false; error = "No active workbook" }; exit }
         $sheet = if ($p.sheet) { $wb.Sheets.Item($p.sheet) } else { $excel.ActiveSheet }
+        $m = [Type]::Missing
         if ($p.before) {
-            $sheet.Move($wb.Sheets.Item($p.before))
+            [void]$sheet.Move($wb.Sheets.Item($p.before))
         } elseif ($p.after) {
-            $sheet.Move($null, $wb.Sheets.Item($p.after))
+            [void]$sheet.Move($m, $wb.Sheets.Item($p.after))
+        } elseif ($null -ne $p.position) {
+            # position 从 0 开始，超出范围时移到末尾
+            $pos = [int]$p.position
+            $cnt = $wb.Sheets.Count
+            if ($pos -ge $cnt - 1) { [void]$sheet.Move($m, $wb.Sheets.Item($cnt)) }
+            else {
+                if ($pos -lt 0) { $pos = 0 }
+                # 目标位置之前的表需排除自身再计数
+                $others = @(); for ($i = 1; $i -le $cnt; $i++) { $s = $wb.Sheets.Item($i); if ($s.Name -ne $sheet.Name) { $others += $s } }
+                [void]$sheet.Move($others[$pos])
+            }
         }
-        Output-Json @{ success = $true; data = @{ movedSheet = $sheet.Name } }
+        Output-Json @{ success = $true; data = @{ movedSheet = $sheet.Name; newPosition = $sheet.Index - 1 } }
     }
 
     "mergeCells" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $range = $sheet.Range($p.range)
         $across = if ($null -ne $p.across) { [bool]$p.across } else { $false }
         $range.Merge($across)
@@ -1464,7 +1619,7 @@ switch ($Action) {
     "unmergeCells" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $range = $sheet.Range($p.range)
         $range.UnMerge()
         Output-Json @{ success = $true; data = @{ range = $p.range } }
@@ -1473,7 +1628,7 @@ switch ($Action) {
     "setColumnWidth" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $col = $p.column
         if ($col -is [int]) { $col = Convert-ColumnNumberToLetter([int]$col) }
         $sheet.Range("${col}:${col}").ColumnWidth = $p.width
@@ -1483,7 +1638,7 @@ switch ($Action) {
     "setRowHeight" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $sheet.Range("$($p.row):$($p.row)").RowHeight = $p.height
         Output-Json @{ success = $true; data = @{ row = $p.row; height = $p.height } }
     }
@@ -1491,7 +1646,7 @@ switch ($Action) {
     "autoFitColumn" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         if ($p.range) {
             $sheet.Range($p.range).Columns.AutoFit()
         } elseif ($p.column) {
@@ -1507,7 +1662,7 @@ switch ($Action) {
     "autoFitRow" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         if ($p.range) {
             $sheet.Range($p.range).Rows.AutoFit()
         } elseif ($p.row) {
@@ -1521,7 +1676,7 @@ switch ($Action) {
     "autoFitAll" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         if ($p.range) { $range = $sheet.Range($p.range) } else { $range = $sheet.UsedRange}
         $range.Columns.AutoFit()
         $range.Rows.AutoFit()
@@ -1531,7 +1686,7 @@ switch ($Action) {
     "setNumberFormat" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $range = $sheet.Range($p.range)
         if ($p.format) { $range.NumberFormat = $p.format }
         Output-Json @{ success = $true; data = @{ range = $p.range; format = $p.format } }
@@ -1540,7 +1695,7 @@ switch ($Action) {
     "wrapText" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $range = $sheet.Range($p.range)
         $wrap = if ($null -ne $p.wrap) { [bool]$p.wrap } else { $true }
         $range.WrapText = $wrap
@@ -1550,7 +1705,7 @@ switch ($Action) {
     "setPrintArea" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         if ($p.range) { $sheet.PageSetup.PrintArea = $p.range } else { $sheet.PageSetup.PrintArea = "" }
         Output-Json @{ success = $true; data = @{ printArea = if ($p.range) { $p.range } else { "cleared" } } }
     }
@@ -1561,7 +1716,8 @@ switch ($Action) {
         $sel = $excel.Selection
         if ($null -eq $sel) { Output-Json @{ success = $false; error = "No selection" }; exit }
         $addr = $sel.Address()
-        Output-Json @{ success = $true; data = @{ address = $addr; rows = $sel.Rows.Count; columns = $sel.Columns.Count } }
+        $sheetName = try { $sel.Worksheet.Name } catch { $excel.ActiveSheet.Name }
+        Output-Json @{ success = $true; data = @{ address = $addr; rows = $sel.Rows.Count; columns = $sel.Columns.Count; sheet = $sheetName } }
     }
 
     "clearRange" {
@@ -1580,76 +1736,79 @@ switch ($Action) {
     "insertRows" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $startRow = if ($p.row) { [int]$p.row } elseif ($p.startRow) { [int]$p.startRow } else { $null }
         if ($null -eq $startRow) { Output-Json @{ success = $false; error = "row/startRow required" }; exit }
         $count = if ($p.count) { [int]$p.count } else { 1 }
         $endRow = $startRow + $count - 1
-        $sheet.Range("${startRow}:${endRow}").Insert()
+        $err = Invoke-ShiftLines $excel $sheet 'row' $startRow $count $true { [void]$sheet.Range("${startRow}:${endRow}").Insert() }
+        if ($err) { Output-Json @{ success = $false; error = $err }; exit }
         Output-Json @{ success = $true; data = @{ insertedAt = $startRow; count = $count } }
     }
 
     "insertColumns" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $col = if ($p.column) { $p.column } elseif ($p.startColumn) { $p.startColumn } else { $null }
         if ($null -eq $col) { Output-Json @{ success = $false; error = "column/startColumn required" }; exit }
         if ($col -is [int]) { $col = Convert-ColumnNumberToLetter([int]$col) }
         $count = if ($p.count) { [int]$p.count } else { 1 }
-        for ($i = 0; $i -lt $count; $i++) {
-            $sheet.Range("${col}:${col}").Insert()
-        }
+        $colNum = Convert-ColumnLetterToNumber $col
+        $colEnd = Convert-ColumnNumberToLetter ($colNum + $count - 1)
+        $err = Invoke-ShiftLines $excel $sheet 'column' $colNum $count $true { [void]$sheet.Range("${col}:${colEnd}").Insert() }
+        if ($err) { Output-Json @{ success = $false; error = $err }; exit }
         Output-Json @{ success = $true; data = @{ insertedAt = $col; count = $count } }
     }
 
     "deleteRows" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $startRow = if ($p.row) { [int]$p.row } elseif ($p.startRow) { [int]$p.startRow } else { $null }
         if ($null -eq $startRow) { Output-Json @{ success = $false; error = "row/startRow required" }; exit }
         $count = if ($p.count) { [int]$p.count } else { 1 }
         $endRow = $startRow + $count - 1
-        $sheet.Range("${startRow}:${endRow}").Delete()
+        $err = Invoke-ShiftLines $excel $sheet 'row' $startRow $count $false { [void]$sheet.Range("${startRow}:${endRow}").Delete() }
+        if ($err) { Output-Json @{ success = $false; error = $err }; exit }
         Output-Json @{ success = $true; data = @{ deletedFrom = $startRow; count = $count } }
     }
 
     "deleteColumns" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $col = if ($p.column) { $p.column } elseif ($p.startColumn) { $p.startColumn } else { $null }
         if ($null -eq $col) { Output-Json @{ success = $false; error = "column/startColumn required" }; exit }
         if ($col -is [int]) { $col = Convert-ColumnNumberToLetter([int]$col) }
         $count = if ($p.count) { [int]$p.count } else { 1 }
-        for ($i = 0; $i -lt $count; $i++) {
-            $sheet.Range("${col}:${col}").Delete()
-        }
+        $colNum = Convert-ColumnLetterToNumber $col
+        $colEnd = Convert-ColumnNumberToLetter ($colNum + $count - 1)
+        $err = Invoke-ShiftLines $excel $sheet 'column' $colNum $count $false { [void]$sheet.Range("${col}:${colEnd}").Delete() }
+        if ($err) { Output-Json @{ success = $false; error = $err }; exit }
         Output-Json @{ success = $true; data = @{ deletedFrom = $col; count = $count } }
     }
 
     "hideRows" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $rows = if ($p.rows) { $p.rows } elseif ($p.row) { @($p.row) } else { @() }
         if ($rows.Count -eq 0) { Output-Json @{ success = $false; error = "row/rows required" }; exit }
-        foreach ($r in $rows) { $sheet.Range("${r}:${r}").Hidden = $true }
+        foreach ($r in $rows) { $sheet.Range("${r}:${r}").EntireRow.Hidden = $true }
         Output-Json @{ success = $true; data = @{ hiddenRows = $rows } }
     }
 
     "hideColumns" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $cols = if ($p.columns) { $p.columns } elseif ($p.column) { @($p.column) } else { @() }
         if ($cols.Count -eq 0) { Output-Json @{ success = $false; error = "column/columns required" }; exit }
         $hidden = @()
         foreach ($c in $cols) {
-            $col = $c
-            if ($col -is [int]) { $col = Convert-ColumnNumberToLetter([int]$col) }
-            $sheet.Range("${col}:${col}").Hidden = $true
+            $col = Resolve-ColumnLetter $c
+            $sheet.Range("${col}:${col}").EntireColumn.Hidden = $true
             $hidden += $col
         }
         Output-Json @{ success = $true; data = @{ hiddenColumns = $hidden } }
@@ -1658,24 +1817,24 @@ switch ($Action) {
     "showRows" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $rows = if ($p.rows) { $p.rows } elseif ($p.row) { @($p.row) } else { @() }
         if ($rows.Count -eq 0) { Output-Json @{ success = $false; error = "row/rows required" }; exit }
-        foreach ($r in $rows) { $sheet.Range("${r}:${r}").Hidden = $false }
+        foreach ($r in $rows) { $sheet.Range("${r}:${r}").EntireRow.Hidden = $false }
         Output-Json @{ success = $true; data = @{ shownRows = $rows } }
     }
 
     "showColumns" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $cols = if ($p.columns) { $p.columns } elseif ($p.column) { @($p.column) } else { @() }
         if ($cols.Count -eq 0) { Output-Json @{ success = $false; error = "column/columns required" }; exit }
         $shown = @()
         foreach ($c in $cols) {
             $col = $c
             if ($col -is [int]) { $col = Convert-ColumnNumberToLetter([int]$col) }
-            $sheet.Range("${col}:${col}").Hidden = $false
+            $sheet.Range("${col}:${col}").EntireColumn.Hidden = $false
             $shown += $col
         }
         Output-Json @{ success = $true; data = @{ shownColumns = $shown } }
@@ -1684,7 +1843,7 @@ switch ($Action) {
     "groupRows" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         if (-not $p.startRow -or -not $p.endRow) { Output-Json @{ success = $false; error = "startRow/endRow required" }; exit }
         $sheet.Range("$($p.startRow):$($p.endRow)").Group()
         Output-Json @{ success = $true; data = @{ grouped = "$($p.startRow):$($p.endRow)" } }
@@ -1693,7 +1852,7 @@ switch ($Action) {
     "groupColumns" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         if (-not $p.startColumn -or -not $p.endColumn) { Output-Json @{ success = $false; error = "startColumn/endColumn required" }; exit }
         $startCol = $p.startColumn
         $endCol = $p.endColumn
@@ -1706,16 +1865,26 @@ switch ($Action) {
     "freezePanes" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
-        if ($p.cell) {
-            $sheet.Range($p.cell).Select()
-        } elseif ($p.row -and $p.column) {
-            $col = $p.column
-            if ($col -is [int]) { $col = Convert-ColumnNumberToLetter([int]$col) }
-            $sheet.Range("$col$($p.row)").Select()
+        $sheet = Get-TargetSheet $excel $p
+        $win = $excel.ActiveWindow
+        $win.FreezePanes = $false
+        if ($p.freeze -eq $false) {
+            $win.SplitRow = 0
+            $win.SplitColumn = 0
+            Output-Json @{ success = $true; data = @{ message = "已取消冻结"; frozen = $false } }
+            exit
         }
-        $excel.ActiveWindow.FreezePanes = $true
-        Output-Json @{ success = $true; data = @{ message = "窗格已冻结" } }
+        if ($p.cell) {
+            [void]$sheet.Range($p.cell).Select()
+        } else {
+            # row/column 表示冻结的行数/列数（冻结前 N 行、前 M 列）
+            $win.ScrollRow = 1
+            $win.ScrollColumn = 1
+            $win.SplitRow = if ($p.row) { [int]$p.row } else { 0 }
+            $win.SplitColumn = if ($p.column) { [int]$p.column } else { 0 }
+        }
+        $win.FreezePanes = $true
+        Output-Json @{ success = $true; data = @{ message = "窗格已冻结"; frozen = $true } }
     }
 
     "unfreezePanes" {
@@ -1728,7 +1897,7 @@ switch ($Action) {
     "findInSheet" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         if ($p.range) { $searchRange = $sheet.Range($p.range) } else { $searchRange = $sheet.UsedRange}
         $results = @()
         $lookAt = if ($p.matchCase) { 1 } else { 2 }
@@ -1798,7 +1967,7 @@ switch ($Action) {
     "pasteRange" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $destRange = $sheet.Range($p.destination)
         if ($p.pasteType -eq "values") {
             $destRange.PasteSpecial(-4163)
@@ -1812,25 +1981,103 @@ switch ($Action) {
         Output-Json @{ success = $true; data = @{ destination = $p.destination } }
     }
 
+    "unprotectWorkbook" {
+        $excel = Get-WpsExcel
+        if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
+        $wb = $excel.ActiveWorkbook
+        if ($null -eq $wb) { Output-Json @{ success = $false; error = "No active workbook" }; exit }
+        $password = if ($p.password) { $p.password } else { "" }
+        [void]$wb.Unprotect($password)
+        Output-Json @{ success = $true; data = @{ workbook = $wb.Name; protected = $false } }
+    }
+
+    "setZoom" {
+        $excel = Get-WpsExcel
+        if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
+        if ($null -eq $excel.ActiveWorkbook) { Output-Json @{ success = $false; error = "No active workbook" }; exit }
+        $percent = [int]$p.percent
+        if ($percent -lt 10 -or $percent -gt 400) { Output-Json @{ success = $false; error = "缩放比例需在 10-400 之间" }; exit }
+        $excel.ActiveWindow.Zoom = $percent
+        Output-Json @{ success = $true; data = @{ zoom = $excel.ActiveWindow.Zoom } }
+    }
+
+    "evaluateFormula" {
+        $excel = Get-WpsExcel
+        if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
+        if ($null -eq $excel.ActiveWorkbook) { Output-Json @{ success = $false; error = "No active workbook" }; exit }
+        $sheet = Get-TargetSheet $excel $p
+        $formula = [string]$p.formula
+        if (-not $formula) { Output-Json @{ success = $false; error = "formula required" }; exit }
+        if (-not $formula.StartsWith("=")) { $formula = "=" + $formula }
+        if ($p.cell) {
+            # 给了目标单元格：写入公式并返回计算值
+            $target = $sheet.Range($p.cell)
+            $target.Formula = $formula
+            $result = $target.Text
+            $value = $target.Value2
+        } else {
+            $value = $sheet.Evaluate($formula)
+            $result = $value
+        }
+        # Evaluate 出错时返回 Int32 错误码（如 -2146826281 = #DIV/0!）
+        $value = Convert-CellError $value
+        if ($value -is [string] -and $value.StartsWith('#')) { $result = $value }
+        Output-Json @{ success = $true; data = @{ formula = $formula; result = $result; value = $value; cell = $p.cell } }
+    }
+
+    "autoSum" {
+        $excel = Get-WpsExcel
+        if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
+        if ($null -eq $excel.ActiveWorkbook) { Output-Json @{ success = $false; error = "No active workbook" }; exit }
+        $sheet = Get-TargetSheet $excel $p
+        $src = $sheet.Range($p.range)
+        $target = $sheet.Range($p.targetCell)
+        $target.Formula = "=SUM(" + $src.Address($false, $false) + ")"
+        Output-Json @{ success = $true; data = @{ range = $p.range; targetCell = $p.targetCell; result = $target.Value2 } }
+    }
+
     "fillSeries" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
+        # 按源区域规律自动填充到目标区域（wps_excel_auto_fill）
+        if ($p.sourceRange -and $p.targetRange) {
+            [void]$sheet.Range($p.sourceRange).AutoFill($sheet.Range($p.targetRange), 0)
+            Output-Json @{ success = $true; data = @{ range = $p.targetRange; type = "autoFill"; filled = $true } }
+            exit
+        }
         $range = $sheet.Range($p.range)
-        $startCell = $range.Cells.Item(1, 1)
-        $startCell.Value2 = if ($null -ne $p.startValue) { $p.startValue } else { 1 }
-        $typeMap = @{ linear = 0; growth = 1; date = 2; autoFill = 3 }
-        $fillType = $typeMap[$p.type]
-        if ($null -eq $fillType) { $fillType = 0 }
-        $step = if ($null -ne $p.step) { $p.step } else { 1 }
-        $range.DataSeries($null, -4132, $fillType, $step)
-        Output-Json @{ success = $true; data = @{ range = $p.range; type = $p.type } }
+        # 只在显式给出 startValue 时写首格，避免覆盖用户已有数据
+        if ($null -ne $p.startValue) { $range.Cells.Item(1, 1).Value2 = $p.startValue }
+        $dir = if ($p.direction) { ([string]$p.direction).ToLower() } else { "down" }
+        $type = if ($p.type) { [string]$p.type } else { "auto" }
+        if ($type -eq "auto" -or $type -eq "autoFill") {
+            switch ($dir) {
+                "down" { $src = $range.Rows.Item(1) }
+                "right" { $src = $range.Columns.Item(1) }
+                "up" { $src = $range.Rows.Item($range.Rows.Count) }
+                "left" { $src = $range.Columns.Item($range.Columns.Count) }
+                default { Output-Json @{ success = $false; error = "不支持的方向: $dir（可选 down/right/up/left）" }; exit }
+            }
+            [void]$src.AutoFill($range, 0)
+        } else {
+            if ($dir -ne "down" -and $dir -ne "right") {
+                Output-Json @{ success = $false; error = "$type 序列仅支持 down/right 方向" }; exit
+            }
+            # DataSeries(Rowcol, Type, Date, Step)：xlRows=1 xlColumns=2；xlDataSeriesLinear=-4132 xlGrowth=2 xlChronological=3；xlDay=1
+            $typeMap = @{ linear = -4132; growth = 2; date = 3 }
+            if (-not $typeMap.ContainsKey($type)) { Output-Json @{ success = $false; error = "不支持的填充类型: $type（可选 linear/growth/date/auto）" }; exit }
+            $rowcol = if ($dir -eq "right") { 1 } else { 2 }
+            $step = if ($null -ne $p.step) { $p.step } else { 1 }
+            [void]$range.DataSeries($rowcol, $typeMap[$type], 1, $step)
+        }
+        Output-Json @{ success = $true; data = @{ range = $p.range; type = $type; direction = $dir } }
     }
 
     "transpose" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $sourceRange = $sheet.Range($p.sourceRange)
         $destCell = if ($p.destinationCell) { $p.destinationCell } elseif ($p.targetCell) { $p.targetCell } else { $null }
         if ($null -eq $destCell) { Output-Json @{ success = $false; error = "destinationCell/targetCell required" }; exit }
@@ -1844,7 +2091,7 @@ switch ($Action) {
     "textToColumns" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $range = $sheet.Range($p.range)
         $delimiter = if ($p.delimiter) { $p.delimiter } else { "," }
         $tab = $false; $semicolon = $false; $comma = $false; $space = $false; $other = $false; $otherChar = $null
@@ -1853,23 +2100,29 @@ switch ($Action) {
         elseif ($delimiter -eq ",") { $comma = $true }
         elseif ($delimiter -eq " ") { $space = $true }
         else { $other = $true; $otherChar = $delimiter }
-        $range.TextToColumns($null, 1, 1, $false, $tab, $semicolon, $comma, $space, $other, $otherChar)
+        # Destination 传 $null 会被 COM 拒绝（值不在预期范围内），缺省用区域首格原位分列
+        if ($p.destination) { $dest = $sheet.Range([string]$p.destination).Cells.Item(1, 1) } else { $dest = $range.Cells.Item(1, 1) }
+        if ($null -eq $otherChar) { $otherChar = [Type]::Missing }
+        [void]$range.TextToColumns($dest, 1, 1, $false, $tab, $semicolon, $comma, $space, $other, $otherChar)
         Output-Json @{ success = $true; data = @{ range = $p.range; delimiter = $delimiter } }
     }
 
     "subtotal" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $range = $sheet.Range($p.range)
-        $funcMap = @{ sum = 9; count = 2; average = 1; max = 4; min = 5 }
-        $func = $funcMap[$p.function]
-        if ($null -eq $func) { $func = 9 }
+        # Range.Subtotal 的 Function 是 XlConsolidationFunction，不是 SUBTOTAL() 的 9/1/2 编号；非法值时 WPS 静默不执行
+        $funcMap = @{ sum = -4157; count = -4112; average = -4106; max = -4136; min = -4139 }
+        $fname = if ($p.function) { ([string]$p.function).ToLower() } else { "sum" }
+        if (-not $funcMap.ContainsKey($fname)) { Output-Json @{ success = $false; error = "不支持的汇总函数: $fname（可选 sum/count/average/max/min）" }; exit }
+        $func = $funcMap[$fname]
         $totalCols = $p.totalColumns
         if ($null -eq $totalCols) { $totalCols = $p.totalColumn }
-        if ($totalCols -isnot [System.Array]) { $totalCols = @($totalCols) }
+        $totalCols = [int[]]@($totalCols)
+        if ($totalCols.Count -eq 0) { Output-Json @{ success = $false; error = "totalColumns required" }; exit }
         $replace = if ($null -ne $p.replace) { [bool]$p.replace } else { $true }
-        $range.Subtotal([int]$p.groupBy, $func, $totalCols, $replace, $false, $true)
+        [void]$range.Subtotal([int]$p.groupBy, $func, $totalCols, $replace, $false, 1)
         Output-Json @{ success = $true; data = @{ range = $p.range } }
     }
 
@@ -1878,7 +2131,7 @@ switch ($Action) {
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
         if ($null -eq $wb) { Output-Json @{ success = $false; error = "No active workbook" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $range = $sheet.Range($p.range)
         $addr = $range.Address()
         $wb.Names.Add($p.name, "=" + $sheet.Name + "!" + $addr)
@@ -1910,7 +2163,7 @@ switch ($Action) {
     "addCellComment" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $cell = $sheet.Range($p.cell)
         if ($cell.Comment) { $cell.Comment.Delete() }
         $cell.AddComment($p.text)
@@ -1921,7 +2174,7 @@ switch ($Action) {
     "deleteCellComment" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $cell = $sheet.Range($p.cell)
         if ($cell.Comment) { $cell.Comment.Delete() }
         Output-Json @{ success = $true; data = @{ cell = $p.cell } }
@@ -1930,10 +2183,18 @@ switch ($Action) {
     "getCellComments" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $comments = @()
+        # 分支内赋值：$x = if(){ Range } 会把多单元格 Range 展开成数组
+        $filter = $null
+        if ($p.range) { $filter = $sheet.Range($p.range) }
         for ($i = 1; $i -le $sheet.Comments.Count; $i++) {
             $c = $sheet.Comments.Item($i)
+            # 按行列边界判断是否落在 range 内（Application.Intersect 在 PowerShell 下参数绑定失败）
+            if ($null -ne $filter) {
+                $cr = $c.Parent.Row; $cc = $c.Parent.Column
+                if ($cr -lt $filter.Row -or $cr -ge $filter.Row + $filter.Rows.Count -or $cc -lt $filter.Column -or $cc -ge $filter.Column + $filter.Columns.Count) { continue }
+            }
             $addr = $c.Parent.Address()
             $comments += @{ cell = ($addr -replace "\$", ""); text = $c.Text(); author = if ($c.Author) { $c.Author } else { "" } }
         }
@@ -1972,9 +2233,11 @@ switch ($Action) {
     "insertExcelImage" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $left = if ($null -ne $p.left) { $p.left } else { 100 }
         $top = if ($null -ne $p.top) { $p.top } else { 100 }
+        # 指定 cell 时以该单元格左上角为锚点
+        if ($p.cell) { $anchorCell = $sheet.Range($p.cell); $left = $anchorCell.Left; $top = $anchorCell.Top }
         $width = if ($null -ne $p.width) { $p.width } else { -1 }
         $height = if ($null -ne $p.height) { $p.height } else { -1 }
         $pic = $sheet.Shapes.AddPicture($p.path, $false, $true, $left, $top, $width, $height)
@@ -1984,7 +2247,7 @@ switch ($Action) {
     "setHyperlink" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $range = $sheet.Range($p.cell)
         $address = if ($p.address) { $p.address } else { "" }
         $subAddress = if ($p.subAddress) { $p.subAddress } else { "" }
@@ -1997,7 +2260,7 @@ switch ($Action) {
     "lockCells" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        $sheet = Get-TargetSheet $excel $p
         $range = $sheet.Range($p.range)
         $locked = if ($null -ne $p.locked) { [bool]$p.locked } else { $true }
         $range.Locked = $locked

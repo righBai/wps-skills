@@ -26,6 +26,7 @@ import {
 } from '../../types/tools';
 import { wpsClient } from '../../client/wps-client';
 import { WpsAppType } from '../../types/wps';
+import { between, columnLetters } from './range-helpers';
 
 /**
  * 插入多行
@@ -208,7 +209,7 @@ export const hideRowsHandler: ToolHandler = async (
   try {
     const response = await wpsClient.executeMethod<{ message: string }>(
       'hideRows',
-      { startRow, endRow, sheet },
+      { rows: between(startRow, endRow), sheet },
       WpsAppType.SPREADSHEET
     );
     if (!response.success) {
@@ -246,7 +247,7 @@ export const showRowsHandler: ToolHandler = async (
   try {
     const response = await wpsClient.executeMethod<{ message: string }>(
       'showRows',
-      { startRow, endRow, sheet },
+      { rows: between(startRow, endRow), sheet },
       WpsAppType.SPREADSHEET
     );
     if (!response.success) {
@@ -284,7 +285,7 @@ export const showColumnsHandler: ToolHandler = async (
   try {
     const response = await wpsClient.executeMethod<{ message: string }>(
       'showColumns',
-      { startColumn, endColumn, sheet },
+      { columns: columnLetters(startColumn, endColumn), sheet },
       WpsAppType.SPREADSHEET
     );
     if (!response.success) {

@@ -27,6 +27,7 @@ import {
 } from '../../types/tools';
 import { wpsClient } from '../../client/wps-client';
 import { WpsAppType } from '../../types/wps';
+import { seq } from './range-helpers';
 
 // ============================================================
 // 1. wps_excel_set_cell_format - 设置单元格格式
@@ -79,9 +80,10 @@ export const setCellFormatHandler: ToolHandler = async (
   };
 
   try {
+    const { bgColor, backgroundColor, ...rest } = format;
     const response = await wpsClient.executeMethod(
-      'setCellFormat',
-      { range, format, sheet },
+      'setCellStyle',
+      { range, sheet, ...rest, backgroundColor: backgroundColor ?? bgColor },
       WpsAppType.SPREADSHEET
     );
 
@@ -247,7 +249,7 @@ export const setBorderHandler: ToolHandler = async (
       'setBorder',
       {
         range,
-        borderStyle,
+        style: borderStyle,
         position: position || 'all',
         color: color || '#000000',
         sheet,
@@ -734,8 +736,8 @@ export const hideRowHandler: ToolHandler = async (
 
   try {
     const response = await wpsClient.executeMethod(
-      'hideRows',
-      { row, count, hide, sheet },
+      hide === false ? 'showRows' : 'hideRows',
+      { rows: seq(row, count), sheet },
       WpsAppType.SPREADSHEET
     );
 

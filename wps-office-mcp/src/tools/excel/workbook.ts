@@ -81,7 +81,7 @@ export const getOpenWorkbooksHandler: ToolHandler = async (
   _args: Record<string, unknown>
 ): Promise<ToolCallResult> => {
   try {
-    const response = await wpsClient.executeMethod<{ workbooks: string[] }>(
+    const response = await wpsClient.executeMethod<{ workbooks: Array<{ name: string; path?: string; sheets?: number; active?: boolean }> }>(
       'getOpenWorkbooks',
       {},
       WpsAppType.SPREADSHEET
@@ -89,7 +89,9 @@ export const getOpenWorkbooksHandler: ToolHandler = async (
     if (!response.success) {
       return { id: uuidv4(), success: false, content: [{ type: 'text', text: `获取工作簿列表失败: ${response.error}` }], error: response.error };
     }
-    const list = response.data?.workbooks || [];
+    const list = (response.data?.workbooks || []).map((w) =>
+      typeof w === 'string' ? w : `${w.name}${w.active ? '（当前）' : ''} - ${w.sheets ?? '?'}个工作表${w.path ? ` - ${w.path}` : ''}`
+    );
     return { id: uuidv4(), success: true, content: [{ type: 'text', text: `已打开的工作簿 (${list.length}个):\n${list.join('\n') || '无'}` }] };
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : String(error);
@@ -169,7 +171,7 @@ export const closeWorkbookHandler: ToolHandler = async (
   try {
     const response = await wpsClient.executeMethod<{ message: string }>(
       'closeWorkbook',
-      { name, save: save !== false },
+      { name, saveChanges: save !== false },
       WpsAppType.SPREADSHEET
     );
     if (!response.success) {
@@ -225,11 +227,11 @@ export const getCellValueDefinition: ToolDefinition = {
   inputSchema: {
     type: 'object',
     properties: {
-      sheet: { type: 'string', description: '工作表名称' },
+      sheet: { type: 'string', description: '工作表名称，不填则为当前工作表' },
       row: { type: 'number', description: '行号（从1开始）' },
       col: { type: 'number', description: '列号（从1开始）' },
     },
-    required: ['sheet', 'row', 'col'],
+    required: ['row', 'col'],
   },
 };
 
@@ -268,7 +270,7 @@ export const setCellValueDefinition: ToolDefinition = {
       col: { type: 'number', description: '列号（从1开始）' },
       value: { type: 'string', description: '要设置的值' },
     },
-    required: ['sheet', 'row', 'col', 'value'],
+    required: ['row', 'col', 'value'],
   },
 };
 
@@ -285,7 +287,7 @@ export const setCellValueHandler: ToolHandler = async (
     if (!response.success) {
       return { id: uuidv4(), success: false, content: [{ type: 'text', text: `设置单元格值失败: ${response.error}` }], error: response.error };
     }
-    return { id: uuidv4(), success: true, content: [{ type: 'text', text: `单元格值已设置: ${sheet}!R${row}C${col} = ${value}` }] };
+    return { id: uuidv4(), success: true, content: [{ type: 'text', text: `单元格值已设置: ${sheet ? `${sheet}!` : ""}R${row}C${col} = ${value}` }] };
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : String(error);
     return { id: uuidv4(), success: false, content: [{ type: 'text', text: `设置单元格值出错: ${errMsg}` }], error: errMsg };
@@ -305,7 +307,7 @@ export const getFormulaDefinition: ToolDefinition = {
       sheet: { type: 'string', description: '工作表名称' },
       cell: { type: 'string', description: '单元格地址，如 A1、B2' },
     },
-    required: ['sheet', 'cell'],
+    required: ['cell'],
   },
 };
 
@@ -342,7 +344,7 @@ export const getCellInfoDefinition: ToolDefinition = {
       sheet: { type: 'string', description: '工作表名称' },
       cell: { type: 'string', description: '单元格地址，如 A1' },
     },
-    required: ['sheet', 'cell'],
+    required: ['cell'],
   },
 };
 
