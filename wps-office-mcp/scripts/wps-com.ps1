@@ -213,6 +213,22 @@ function Convert-HexColorToRgbInt([string]$hex) {
     return $r + ($g * 256) + ($b * 65536)
 }
 
+# 二维数据一次性写入以 $anchor 为左上角的区域。
+# 不能逐格 .Value2 = $v：PowerShell 会缓存该调用点首次绑定的类型，先写字符串后再写 Int32 会 InvalidCast
+function Write-Grid($anchor, $data) {
+    $rows = @($data).Count
+    if ($rows -eq 0) { return }
+    $cols = 0
+    foreach ($row in $data) { if (@($row).Count -gt $cols) { $cols = @($row).Count } }
+    if ($cols -eq 0) { return }
+    $grid = New-Object 'object[,]' $rows, $cols
+    for ($r = 0; $r -lt $rows; $r++) {
+        $row = @($data[$r])
+        for ($c = 0; $c -lt $row.Count; $c++) { $grid[$r, $c] = $row[$c] }
+    }
+    $anchor.Cells.Item(1, 1).Resize($rows, $cols).Value2 = $grid
+}
+
 function Get-RangeFromAddress($workbook, [string]$address) {
     if ($address -match "^(?<sheet>[^!]+)!(?<range>.+)$") {
         $sheetName = $matches.sheet.Trim("'")
@@ -590,10 +606,7 @@ switch ($Action) {
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
         if ($p.sheet) { $sheet = $wb.Sheets.Item($p.sheet) } else { $sheet = $wb.ActiveSheet }
-        $range = $sheet.Range($p.range)
-        for ($r = 0; $r -lt $p.data.Count; $r++) {
-            for ($c = 0; $c -lt $p.data[$r].Count; $c++) { $range.Cells.Item($r + 1, $c + 1).Value2 = $p.data[$r][$c] }
-        }
+        Write-Grid $sheet.Range($p.range) $p.data
         Output-Json @{ success = $true }
     }
 
@@ -916,16 +929,18 @@ switch ($Action) {
     "addConditionalFormat" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        if ($p.sheet) { $sheet = $excel.ActiveWorkbook.Sheets.Item($p.sheet) } else { $sheet = $excel.ActiveSheet }
         $range = $sheet.Range($p.range)
         $formatType = if ($p.type) { $p.type } else { "cellValue" }
         if ($formatType -eq "cellValue") {
-            $operatorMap = @{ greater = 5; greaterThan = 5; less = 6; lessThan = 6; equal = 3; notEqual = 4; greaterEqual = 7; greaterThanOrEqual = 7; lessEqual = 8; lessThanOrEqual = 8; between = 1 }
-            $op = $operatorMap[$p.operator]
+            $operatorMap = @{ greater = 5; greaterThan = 5; less = 6; lessThan = 6; equal = 3; notEqual = 4; greaterEqual = 7; greaterThanOrEqual = 7; lessEqual = 8; lessThanOrEqual = 8; between = 1; notBetween = 2 }
+            $op = $null
+            if ($p.operator) { $op = $operatorMap[[string]$p.operator] }
             if ($null -eq $op) { $op = 3 }
-            $val1 = if ($null -ne $p.value1) { $p.value1 } else { $p.value }
-            $val2 = $p.value2
+            $val1 = if ($null -ne $p.value1) { [string]$p.value1 } else { [string]$p.value }
+            if ($null -ne $p.value2) { $val2 = [string]$p.value2 } else { $val2 = [Type]::Missing }
             $cf = $range.FormatConditions.Add(1, $op, $val1, $val2)
+            if ($null -ne $cf -and $p.bold) { $cf.Font.Bold = $true }
             if ($null -ne $cf -and $p.backgroundColor) {
                 $bg = Convert-HexColorToRgbInt([string]$p.backgroundColor)
                 if ($null -ne $bg) { $cf.Interior.Color = $bg }
@@ -936,7 +951,7 @@ switch ($Action) {
             }
         } elseif ($formatType -eq "colorScale") {
             $scaleType = if ($p.colorScaleType) { $p.colorScaleType } else { 3 }
-            $range.FormatConditions.AddColorScale($scaleType)
+            [void]$range.FormatConditions.AddColorScale($scaleType)
         } elseif ($formatType -eq "dataBar") {
             $range.FormatConditions.AddDatabar() | Out-Null
         }
@@ -973,25 +988,36 @@ switch ($Action) {
     "addDataValidation" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        if ($p.sheet) { $sheet = $excel.ActiveWorkbook.Sheets.Item($p.sheet) } else { $sheet = $excel.ActiveSheet }
         $range = $sheet.Range($p.range)
+        # 兼容 TS 工具的参数名：type / formula
+        $vType = if ($p.validationType) { [string]$p.validationType } elseif ($p.type) { [string]$p.type } else { "list" }
+        $f1 = if ($p.formula1) { [string]$p.formula1 } elseif ($p.formula) { [string]$p.formula } else { $null }
+        $f2 = if ($p.formula2) { [string]$p.formula2 } else { $null }
         $typeMap = @{ list = 3; whole = 1; decimal = 2; date = 4; time = 5; textLength = 6; custom = 7 }
-        $validationType = $typeMap[$p.validationType]
-        if ($null -eq $validationType) { $validationType = 3 }
-        $range.Validation.Delete()
-        if ($p.validationType -eq "list") {
-            $listFormula = if ($p.formula1) { $p.formula1 } elseif ($p.list) { ($p.list -join ",") } else { "" }
-            $range.Validation.Add($validationType, 1, 1, $listFormula)
+        $validationType = $typeMap[$vType]
+        if ($null -eq $validationType) { Output-Json @{ success = $false; error = "不支持的验证类型: $vType（可选 list/whole/decimal/date/time/textLength/custom）" }; exit }
+        [void]$range.Validation.Delete()
+        if ($vType -eq "list") {
+            $listFormula = if ($f1) { $f1 } elseif ($p.list) { ($p.list -join ",") } else { "" }
+            [void]$range.Validation.Add($validationType, 1, 1, $listFormula)
             if ($null -ne $p.showDropdown -and -not [bool]$p.showDropdown) {
                 $range.Validation.InCellDropdown = $false
             } else {
                 $range.Validation.InCellDropdown = $true
             }
+        } elseif ($vType -eq "custom") {
+            [void]$range.Validation.Add($validationType, 1, 1, $f1)
         } else {
+            # 数值/日期/长度类："1,100" 表示介于 1 与 100 之间
+            if ($f1 -and -not $f2 -and -not $p.operator -and $f1.Contains(",")) {
+                $parts = $f1.Split(",", 2); $f1 = $parts[0].Trim(); $f2 = $parts[1].Trim()
+            }
             $operatorMap = @{ between = 1; notBetween = 2; equal = 3; notEqual = 4; greater = 5; less = 6; greaterEqual = 7; lessEqual = 8 }
-            $op = $operatorMap[$p.operator]
+            $op = $null
+            if ($p.operator) { $op = $operatorMap[[string]$p.operator] }
             if ($null -eq $op) { $op = 1 }
-            $range.Validation.Add($validationType, 1, $op, $p.formula1, $p.formula2)
+            if ($f2) { [void]$range.Validation.Add($validationType, 1, $op, $f1, $f2) } else { [void]$range.Validation.Add($validationType, 1, $op, $f1) }
         }
         if ($p.inputTitle -or $p.inputMessage) {
             $range.Validation.InputTitle = if ($p.inputTitle) { $p.inputTitle } else { "" }
@@ -1001,7 +1027,7 @@ switch ($Action) {
             $range.Validation.ErrorTitle = if ($p.errorTitle) { $p.errorTitle } else { "" }
             $range.Validation.ErrorMessage = if ($p.errorMessage) { $p.errorMessage } else { "" }
         }
-        Output-Json @{ success = $true; data = @{ range = $p.range; type = $p.validationType } }
+        Output-Json @{ success = $true; data = @{ range = $p.range; type = $vType } }
     }
 
     "removeDataValidation" {
@@ -1144,12 +1170,27 @@ switch ($Action) {
     "sortRange" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        if ($p.sheet) { $sheet = $excel.ActiveWorkbook.Sheets.Item($p.sheet) } else { $sheet = $excel.ActiveSheet }
         $range = $sheet.Range($p.range)
-        $keyCol = $sheet.Range($p.keyColumn)
-        $order = if ($p.order -eq "desc") { 2 } else { 1 }
-        $range.Sort($keyCol, $order)
-        Output-Json @{ success = $true }
+        # 排序键：keyColumn（单元格地址）或 column（工作表列号 / 列字母）
+        $keyCol = $null
+        if ($p.keyColumn) {
+            $keyCol = $sheet.Range([string]$p.keyColumn)
+        } elseif ($null -ne $p.column) {
+            $col = [string]$p.column
+            if ($col -match '^\d+$') { $colNum = [int]$col } else { $colNum = Convert-ColumnLetterToNumber $col }
+            $firstCol = $range.Column; $lastCol = $firstCol + $range.Columns.Count - 1
+            if ($null -eq $colNum -or $colNum -lt $firstCol -or $colNum -gt $lastCol) {
+                Output-Json @{ success = $false; error = "排序列 $col 不在范围 $($p.range) 内" }; exit
+            }
+            $keyCol = $sheet.Cells.Item($range.Row, $colNum)
+        }
+        if ($null -eq $keyCol) { Output-Json @{ success = $false; error = "缺少排序列参数 column" }; exit }
+        $order = if ($p.order -eq "desc" -or $p.ascending -eq $false) { 2 } else { 1 }
+        $header = if ($p.hasHeader) { 1 } else { 2 }
+        $m = [Type]::Missing
+        [void]$range.Sort($keyCol, $order, $m, $m, 1, $m, 1, $header)
+        Output-Json @{ success = $true; data = @{ range = $p.range; order = $order; header = $header } }
     }
 
     "autoFilter" {
@@ -1322,7 +1363,13 @@ switch ($Action) {
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
         if ($null -eq $wb) { Output-Json @{ success = $false; error = "No active workbook" }; exit }
-        $sheet = $wb.Sheets.Add()
+        # position 从 0 开始；不填或超出范围时添加到末尾
+        $cnt = $wb.Sheets.Count
+        if ($null -ne $p.position -and [int]$p.position -ge 0 -and [int]$p.position -lt $cnt) {
+            $sheet = $wb.Sheets.Add($wb.Sheets.Item([int]$p.position + 1))
+        } else {
+            $sheet = $wb.Sheets.Add([Type]::Missing, $wb.Sheets.Item($cnt))
+        }
         if ($p.name) { $sheet.Name = $p.name }
         Output-Json @{ success = $true; data = @{ sheetName = $sheet.Name; sheetIndex = $sheet.Index } }
     }
@@ -1702,20 +1749,50 @@ switch ($Action) {
     "replaceInSheet" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
+        if ($p.sheet) { $sheet = $excel.ActiveWorkbook.Sheets.Item($p.sheet) } else { $sheet = $excel.ActiveSheet }
         if ($p.range) { $searchRange = $sheet.Range($p.range) } else { $searchRange = $sheet.UsedRange}
-        $lookAt = if ($p.matchCase) { 1 } else { 2 }
-        $replaced = $searchRange.Replace($p.searchText, $p.replaceText, $lookAt)
-        Output-Json @{ success = $true; data = @{ searchText = $p.searchText; replaceText = $p.replaceText; success = $replaced } }
+        $what = [string]$p.searchText
+        $matchCase = [bool]$p.matchCase
+        # LookAt: 1=整格匹配 2=部分匹配；MatchCase 是独立参数
+        $lookAt = if ($p.matchEntire) { 1 } else { 2 }
+        # 替换前统计命中单元格数（Replace 作用于公式文本，因此按 Formula 统计）
+        $count = 0
+        $cmp = if ($matchCase) { [StringComparison]::Ordinal } else { [StringComparison]::OrdinalIgnoreCase }
+        $formulas = $searchRange.Formula
+        if ($formulas -is [array]) { $items = @($formulas) } else { $items = @(, $formulas) }
+        foreach ($f in $items) {
+            $s = [string]$f
+            if ($s -eq '') { continue }
+            if ($lookAt -eq 1) { if ([string]::Equals($s, $what, $cmp)) { $count++ } }
+            elseif ($s.IndexOf($what, $cmp) -ge 0) { $count++ }
+        }
+        $m = [Type]::Missing
+        if ($count -gt 0) { [void]$searchRange.Replace($what, [string]$p.replaceText, $lookAt, $m, $matchCase) }
+        Output-Json @{ success = $true; data = @{ searchText = $what; replaceText = $p.replaceText; count = $count } }
     }
 
     "copyRange" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = $excel.ActiveSheet
-        $range = $sheet.Range($p.range)
-        $range.Copy()
-        Output-Json @{ success = $true; data = @{ range = $p.range; message = "已复制到剪贴板" } }
+        if ($p.sheet) { $sheet = $excel.ActiveWorkbook.Sheets.Item($p.sheet) } else { $sheet = $excel.ActiveSheet }
+        # 兼容 TS 工具的参数名：source / destination
+        $srcAddr = if ($p.source) { [string]$p.source } else { [string]$p.range }
+        $src = $sheet.Range($srcAddr)
+        if ($p.destination) {
+            # 目标支持跨表写法 "Sheet2!A1"
+            $dstAddr = [string]$p.destination
+            if ($dstAddr.Contains("!")) {
+                $parts = $dstAddr.Split("!", 2)
+                $dst = $excel.ActiveWorkbook.Sheets.Item($parts[0].Trim("'")).Range($parts[1])
+            } else {
+                $dst = $sheet.Range($dstAddr)
+            }
+            [void]$src.Copy($dst)
+            Output-Json @{ success = $true; data = @{ source = $srcAddr; destination = $dstAddr; message = "已复制 $srcAddr 到 $dstAddr" } }
+        } else {
+            [void]$src.Copy()
+            Output-Json @{ success = $true; data = @{ range = $srcAddr; message = "已复制到剪贴板" } }
+        }
     }
 
     "pasteRange" {
@@ -4508,14 +4585,7 @@ switch ($Action) {
         $chart = $shape.Chart
         $chart.ChartData.Activate()
         $dataSheet = $chart.ChartData.Workbook.Worksheets.Item(1)
-        if ($p.data) {
-            for ($r = 0; $r -lt $p.data.Count; $r++) {
-                $rowData = $p.data[$r]
-                for ($c = 0; $c -lt $rowData.Count; $c++) {
-                    $dataSheet.Cells.Item($r + 1, $c + 1).Value2 = $rowData[$c]
-                }
-            }
-        }
+        if ($p.data) { Write-Grid $dataSheet.Range("A1") $p.data }
         Output-Json @{ success = $true; data = @{ chartName = $shape.Name } }
     }
 

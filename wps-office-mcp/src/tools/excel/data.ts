@@ -30,6 +30,7 @@ import {
 } from '../../types/tools';
 import { wpsClient } from '../../client/wps-client';
 import { WpsAppType } from '../../types/wps';
+import { parseCondition, parseFormat } from './conditional-format-parser';
 
 /**
  * 读取指定范围的单元格数据
@@ -427,8 +428,13 @@ export const sortRangeDefinition: ToolDefinition = {
     type: 'object',
     properties: {
       range: { type: 'string', description: '要排序的范围，如 A1:D100' },
-      column: { type: 'number', description: '排序依据的列号（从1开始）' },
+      column: {
+        type: 'string',
+        description: '排序依据的列：列字母如 "C"，或工作表列号如 "3"（A=1），须位于 range 内',
+      },
       ascending: { type: 'boolean', description: '是否升序，默认true' },
+      has_header: { type: 'boolean', description: 'range 首行是否为表头（表头不参与排序），默认false' },
+      sheet: { type: 'string', description: '工作表名称，不填则使用当前活动工作表' },
     },
     required: ['range', 'column'],
   },
@@ -437,15 +443,17 @@ export const sortRangeDefinition: ToolDefinition = {
 export const sortRangeHandler: ToolHandler = async (
   args: Record<string, unknown>
 ): Promise<ToolCallResult> => {
-  const { range, column, ascending } = args as {
+  const { range, column, ascending, has_header, sheet } = args as {
     range: string;
-    column: number;
+    column: number | string;
     ascending?: boolean;
+    has_header?: boolean;
+    sheet?: string;
   };
   try {
     const response = await wpsClient.executeMethod<{ message: string }>(
       'sortRange',
-      { range, column, ascending: ascending !== false },
+      { range, column, ascending: ascending !== false, hasHeader: has_header === true, sheet },
       WpsAppType.SPREADSHEET
     );
     if (!response.success) {
@@ -471,6 +479,9 @@ export const findReplaceDefinition: ToolDefinition = {
       find: { type: 'string', description: '要查找的文本' },
       replace: { type: 'string', description: '替换为的文本' },
       matchCase: { type: 'boolean', description: '是否区分大小写，默认false' },
+      matchEntire: { type: 'boolean', description: '是否要求整个单元格完全匹配，默认false（部分匹配）' },
+      range: { type: 'string', description: '限定查找范围，如 A1:D100，不填则为整个已用区域' },
+      sheet: { type: 'string', description: '工作表名称，不填则使用当前活动工作表' },
     },
     required: ['find', 'replace'],
   },
@@ -479,15 +490,19 @@ export const findReplaceDefinition: ToolDefinition = {
 export const findReplaceHandler: ToolHandler = async (
   args: Record<string, unknown>
 ): Promise<ToolCallResult> => {
-  const { find, replace, matchCase } = args as {
+  const { find, replace, matchCase, matchEntire, range, sheet } = args as {
     find: string;
     replace: string;
     matchCase?: boolean;
+    matchEntire?: boolean;
+    range?: string;
+    sheet?: string;
   };
   try {
+    // 'findReplace' 是 Word 的 action，Excel 使用 replaceInSheet
     const response = await wpsClient.executeMethod<{ count: number; message: string }>(
-      'findReplace',
-      { find, replace, matchCase: matchCase || false },
+      'replaceInSheet',
+      { searchText: find, replaceText: replace, matchCase: matchCase === true, matchEntire: matchEntire === true, range, sheet },
       WpsAppType.SPREADSHEET
     );
     if (!response.success) {
@@ -625,8 +640,15 @@ export const setConditionalFormatDefinition: ToolDefinition = {
     type: 'object',
     properties: {
       range: { type: 'string', description: '要设置条件格式的范围，如 A1:D100' },
-      condition: { type: 'string', description: '条件表达式，如 ">100"、"=0"、"between(1,10)"' },
-      format: { type: 'string', description: '格式描述，如 "red_fill"、"bold"、"green_font"' },
+      condition: {
+        type: 'string',
+        description: '条件表达式：">100"、"<0"、">=5"、"<=5"、"=0"、"<>0"、"between(1,10)"、"notBetween(1,10)"，文本如 "=完成"',
+      },
+      format: {
+        type: 'string',
+        description: '格式描述，可逗号组合：bold、<颜色>_fill、<颜色>_font（red/green/yellow/orange/blue/purple/gray），或 fill:#RRGGBB、font:#RRGGBB，如 "red_fill,bold"',
+      },
+      sheet: { type: 'string', description: '工作表名称，不填则使用当前活动工作表' },
     },
     required: ['range', 'condition', 'format'],
   },
@@ -635,17 +657,25 @@ export const setConditionalFormatDefinition: ToolDefinition = {
 export const setConditionalFormatHandler: ToolHandler = async (
   args: Record<string, unknown>
 ): Promise<ToolCallResult> => {
-  const { range, condition, format } = args as { range: string; condition: string; format: string };
+  const { range, condition, format, sheet } = args as { range: string; condition: unknown; format: unknown; sheet?: string };
+  const show = (v: unknown) => (typeof v === 'string' ? v : JSON.stringify(v));
+  let parsed;
+  try {
+    parsed = { ...parseCondition(condition), ...parseFormat(format) };
+  } catch (error) {
+    const errMsg = error instanceof Error ? error.message : String(error);
+    return { id: uuidv4(), success: false, content: [{ type: 'text', text: `设置条件格式失败: ${errMsg}` }], error: errMsg };
+  }
   try {
     const response = await wpsClient.executeMethod<{ message: string }>(
       'addConditionalFormat',
-      { range, condition, format },
+      { range, sheet, type: 'cellValue', ...parsed },
       WpsAppType.SPREADSHEET
     );
     if (!response.success) {
       return { id: uuidv4(), success: false, content: [{ type: 'text', text: `设置条件格式失败: ${response.error}` }], error: response.error };
     }
-    return { id: uuidv4(), success: true, content: [{ type: 'text', text: `条件格式设置成功！范围: ${range}，条件: ${condition}，格式: ${format}` }] };
+    return { id: uuidv4(), success: true, content: [{ type: 'text', text: `条件格式设置成功！范围: ${range}，条件: ${show(condition)}，格式: ${show(format)}` }] };
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : String(error);
     return { id: uuidv4(), success: false, content: [{ type: 'text', text: `设置条件格式出错: ${errMsg}` }], error: errMsg };
