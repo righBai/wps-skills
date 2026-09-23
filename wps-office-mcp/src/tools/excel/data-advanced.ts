@@ -14,6 +14,7 @@ import {
 } from '../../types/tools';
 import { wpsClient } from '../../client/wps-client';
 import { WpsAppType } from '../../types/wps';
+import { fieldIndex } from './range-helpers';
 
 /**
  * 自动筛选
@@ -26,7 +27,7 @@ export const autoFilterDefinition: ToolDefinition = {
     type: 'object',
     properties: {
       range: { type: 'string', description: '筛选范围，如 A1:D100' },
-      column: { type: 'string', description: '筛选列标识' },
+      column: { type: 'string', description: '筛选列：列字母如 "C"（按区域换算），或区域内第几列如 "2"；有 criteria 时必填' },
       criteria: { type: 'string', description: '筛选条件' },
       sheet: { type: 'string', description: '工作表名称' },
     },
@@ -43,7 +44,7 @@ export const autoFilterHandler: ToolHandler = async (
   try {
     const response = await wpsClient.executeMethod<{ message: string }>(
       'autoFilter',
-      { range, column, criteria, sheet },
+      { range, field: column ? fieldIndex(range, column) : criteria ? 1 : undefined, criteria, sheet },
       WpsAppType.SPREADSHEET
     );
     if (!response.success) {
@@ -67,10 +68,10 @@ export const copyRangeDefinition: ToolDefinition = {
     type: 'object',
     properties: {
       source: { type: 'string', description: '源范围，如 A1:C10' },
-      destination: { type: 'string', description: '目标位置，如 E1' },
+      destination: { type: 'string', description: '目标位置，如 E1 或 Sheet2!A1；不填则复制到剪贴板，再用 wps_excel_paste_range 粘贴' },
       sheet: { type: 'string', description: '工作表名称' },
     },
-    required: ['source', 'destination'],
+    required: ['source'],
   },
 };
 
@@ -78,7 +79,7 @@ export const copyRangeHandler: ToolHandler = async (
   args: Record<string, unknown>
 ): Promise<ToolCallResult> => {
   const { source, destination, sheet } = args as {
-    source: string; destination: string; sheet?: string;
+    source: string; destination?: string; sheet?: string;
   };
   try {
     const response = await wpsClient.executeMethod<{ message: string }>(
@@ -89,7 +90,7 @@ export const copyRangeHandler: ToolHandler = async (
     if (!response.success) {
       return { id: uuidv4(), success: false, content: [{ type: 'text', text: `复制范围失败: ${response.error}` }], error: response.error };
     }
-    return { id: uuidv4(), success: true, content: [{ type: 'text', text: `已复制 ${source} 到 ${destination}` }] };
+    return { id: uuidv4(), success: true, content: [{ type: 'text', text: destination ? `已复制 ${source} 到 ${destination}` : `已复制 ${source} 到剪贴板` }] };
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : String(error);
     return { id: uuidv4(), success: false, content: [{ type: 'text', text: `复制范围出错: ${errMsg}` }], error: errMsg };
@@ -209,7 +210,7 @@ export const transposeHandler: ToolHandler = async (
   try {
     const response = await wpsClient.executeMethod<{ message: string }>(
       'transpose',
-      { source, destination, sheet },
+      { sourceRange: source, destinationCell: destination, sheet },
       WpsAppType.SPREADSHEET
     );
     if (!response.success) {
@@ -273,12 +274,12 @@ export const subtotalDefinition: ToolDefinition = {
     type: 'object',
     properties: {
       range: { type: 'string', description: '数据范围，如 A1:D100' },
-      groupBy: { type: 'string', description: '分组列标识' },
+      groupBy: { type: 'string', description: '分组列：列字母如 "B" 或区域内第几列如 "2"' },
       function: { type: 'string', description: '汇总函数', enum: ['sum', 'count', 'average', 'max', 'min'] },
       columns: {
         type: 'array',
         items: { type: 'string' },
-        description: '要汇总的列标识列表',
+        description: '要汇总的列：列字母如 ["C","D"] 或区域内列序号如 ["3","4"]',
       },
       sheet: { type: 'string', description: '工作表名称' },
     },
@@ -295,7 +296,13 @@ export const subtotalHandler: ToolHandler = async (
   try {
     const response = await wpsClient.executeMethod<{ message: string }>(
       'subtotal',
-      { range, groupBy, function: func, columns, sheet },
+      {
+        range,
+        groupBy: fieldIndex(range, groupBy),
+        function: func,
+        totalColumns: (columns || []).map((c) => fieldIndex(range, c)),
+        sheet,
+      },
       WpsAppType.SPREADSHEET
     );
     if (!response.success) {

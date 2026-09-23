@@ -52,6 +52,30 @@ export enum ChartType {
   RADAR = 'radar',
 }
 
+/** 常见简写/中文别名 -> 标准类型 */
+const CHART_TYPE_ALIASES: Record<string, ChartType> = {
+  column: ChartType.COLUMN_CLUSTERED,
+  bar: ChartType.BAR_CLUSTERED,
+  stacked_column: ChartType.COLUMN_STACKED,
+  line_marker: ChartType.LINE_MARKERS,
+  donut: ChartType.DOUGHNUT,
+  柱状图: ChartType.COLUMN_CLUSTERED,
+  柱形图: ChartType.COLUMN_CLUSTERED,
+  条形图: ChartType.BAR_CLUSTERED,
+  折线图: ChartType.LINE,
+  饼图: ChartType.PIE,
+  环形图: ChartType.DOUGHNUT,
+  散点图: ChartType.SCATTER,
+  面积图: ChartType.AREA,
+  雷达图: ChartType.RADAR,
+};
+
+function normalizeChartType<T extends string | undefined>(t: T): T {
+  if (typeof t !== 'string') return t;
+  const k = t.trim().toLowerCase();
+  return (CHART_TYPE_ALIASES[k] ?? k) as T;
+}
+
 /**
  * 图表类型到WPS常量的映射
  * WPS SDK用的是Excel的XlChartType常量
@@ -159,7 +183,7 @@ export const createChartHandler: ToolHandler = async (
 ): Promise<ToolCallResult> => {
   const {
     data_range,
-    chart_type = ChartType.COLUMN_CLUSTERED,
+    chart_type: rawChartType = ChartType.COLUMN_CLUSTERED,
     title,
     position,
     sheet,
@@ -181,6 +205,7 @@ export const createChartHandler: ToolHandler = async (
     show_legend?: boolean;
     show_data_labels?: boolean;
   };
+  const chart_type = normalizeChartType(rawChartType);
 
   // 校验数据范围格式
   if (!data_range || !/^[A-Z]+[0-9]+(:[A-Z]+[0-9]+)?$/i.test(data_range)) {
@@ -363,7 +388,7 @@ export const updateChartHandler: ToolHandler = async (
     chart_index,
     chart_name,
     title,
-    chart_type,
+    chart_type: rawChartType,
     show_legend,
     legend_position,
     show_data_labels,
@@ -382,6 +407,7 @@ export const updateChartHandler: ToolHandler = async (
     colors?: string[];
     sheet?: string;
   };
+  const chart_type = normalizeChartType(rawChartType);
 
   // 必须指定图表索引或名称
   if (chart_index === undefined && !chart_name) {

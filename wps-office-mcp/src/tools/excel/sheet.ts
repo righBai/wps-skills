@@ -34,6 +34,7 @@ import {
 } from '../../types/tools';
 import { wpsClient } from '../../client/wps-client';
 import { WpsAppType } from '../../types/wps';
+import { seq } from './range-helpers';
 
 /**
  * 创建新工作表
@@ -136,7 +137,7 @@ export const deleteSheetHandler: ToolHandler = async (
       deleted: string;
     }>(
       'deleteSheet',
-      { name },
+      { sheet: name },
       WpsAppType.SPREADSHEET
     );
 
@@ -207,7 +208,7 @@ export const renameSheetHandler: ToolHandler = async (
       newName: string;
     }>(
       'renameSheet',
-      { oldName, newName },
+      { sheet: oldName, newName },
       WpsAppType.SPREADSHEET
     );
 
@@ -279,12 +280,13 @@ export const copySheetHandler: ToolHandler = async (
 
   try {
     const response = await wpsClient.executeMethod<{
-      sourceName: string;
-      newName: string;
-      index: number;
+      copiedFrom: string;
+      sourceName?: string;
+      newName?: string;
+      index?: number;
     }>(
       'copySheet',
-      { name, newName, position },
+      { sheet: name, newName, position },
       WpsAppType.SPREADSHEET
     );
 
@@ -303,7 +305,7 @@ export const copySheetHandler: ToolHandler = async (
       content: [
         {
           type: 'text',
-          text: `工作表复制成功！\n源工作表: ${response.data.sourceName}\n新工作表: ${response.data.newName}\n位置: 第${response.data.index + 1}个`,
+          text: `工作表复制成功！\n源工作表: ${response.data.sourceName ?? response.data.copiedFrom}${response.data.newName ? `\n新工作表: ${response.data.newName}` : ''}${typeof response.data.index === 'number' ? `\n位置: 第${response.data.index + 1}个` : ''}`,
         },
       ],
     };
@@ -336,12 +338,14 @@ export const getSheetListHandler: ToolHandler = async (
 ): Promise<ToolCallResult> => {
   try {
     const response = await wpsClient.executeMethod<{
+      // 后端 index 从 1 开始
       sheets: Array<{
         name: string;
         index: number;
-        active: boolean;
+        visible?: number | boolean;
       }>;
       count: number;
+      activeSheet?: string;
     }>(
       'getSheetList',
       {},
@@ -357,12 +361,12 @@ export const getSheetListHandler: ToolHandler = async (
       };
     }
 
-    const { sheets, count } = response.data;
+    const { sheets, count, activeSheet } = response.data;
     let output = `当前工作簿共有 ${count} 个工作表：\n\n`;
 
     sheets.forEach((sheet) => {
-      const activeFlag = sheet.active ? ' [活动]' : '';
-      output += `${sheet.index + 1}. ${sheet.name}${activeFlag}\n`;
+      const activeFlag = sheet.name === activeSheet ? ' [活动]' : '';
+      output += `${sheet.index}. ${sheet.name}${activeFlag}\n`;
     });
 
     return {
@@ -410,7 +414,7 @@ export const switchSheetHandler: ToolHandler = async (
       activatedSheet: string;
     }>(
       'switchSheet',
-      { name },
+      { sheet: name },
       WpsAppType.SPREADSHEET
     );
 
@@ -477,11 +481,11 @@ export const moveSheetHandler: ToolHandler = async (
 
   try {
     const response = await wpsClient.executeMethod<{
-      name: string;
-      newPosition: number;
+      movedSheet: string;
+      newPosition?: number;
     }>(
       'moveSheet',
-      { name, position },
+      { sheet: name, position },
       WpsAppType.SPREADSHEET
     );
 
@@ -534,9 +538,9 @@ export const getSelectionHandler: ToolHandler = async (
   try {
     const response = await wpsClient.executeMethod<{
       address: string;
-      rowCount: number;
-      columnCount: number;
-      sheet: string;
+      rows: number;
+      columns: number;
+      sheet?: string;
     }>(
       'getSelection',
       {},
@@ -552,7 +556,7 @@ export const getSelectionHandler: ToolHandler = async (
       };
     }
 
-    const { address, rowCount, columnCount, sheet } = response.data;
+    const { address, rows: rowCount, columns: columnCount, sheet = '(当前工作表)' } = response.data;
 
     return {
       id: uuidv4(),
@@ -1015,7 +1019,7 @@ export const hideColumnDefinition: ToolDefinition = {
         description: '是否隐藏，true为隐藏，false为显示',
       },
     },
-    required: ['column', 'count', 'hide'],
+    required: ['column', 'hide'],
   },
 };
 
@@ -1030,12 +1034,10 @@ export const hideColumnHandler: ToolHandler = async (
 
   try {
     const response = await wpsClient.executeMethod<{
-      column: number;
-      count: number;
-      hidden: boolean;
+      hiddenColumns: string[];
     }>(
-      'hideColumns',
-      { column, count, hide },
+      hide === false ? 'showColumns' : 'hideColumns',
+      { columns: seq(column, count) },
       WpsAppType.SPREADSHEET
     );
 

@@ -86,7 +86,7 @@ export const getCellCommentsHandler: ToolHandler = async (
   const { range, sheet } = args as { range?: string; sheet?: string };
   try {
     const response = await wpsClient.executeMethod<{
-      comments: Array<{ cell: string; comment: string; author?: string }>;
+      comments: Array<{ cell: string; text: string; author?: string }>;
     }>(
       'getCellComments',
       { range, sheet },
@@ -101,7 +101,7 @@ export const getCellCommentsHandler: ToolHandler = async (
     }
     let output = `找到${comments.length}条批注：\n\n`;
     comments.forEach((c) => {
-      output += `- ${c.cell}: ${c.comment}${c.author ? ` (作者: ${c.author})` : ''}\n`;
+      output += `- ${c.cell}: ${c.text}${c.author ? ` (作者: ${c.author})` : ''}\n`;
     });
     return { id: uuidv4(), success: true, content: [{ type: 'text', text: output }] };
   } catch (error) {
@@ -298,7 +298,7 @@ export const setHyperlinkHandler: ToolHandler = async (
   try {
     const response = await wpsClient.executeMethod<{ message: string }>(
       'setHyperlink',
-      { cell, url, text, sheet },
+      { cell, address: url, textToDisplay: text || url, sheet },
       WpsAppType.SPREADSHEET
     );
     if (!response.success) {

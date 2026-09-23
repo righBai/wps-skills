@@ -70,7 +70,7 @@ export const setFormulaHandler: ToolHandler = async (
   }
 
   try {
-    const response = await wpsClient.executeMethod(
+    const response = await wpsClient.executeMethod<{ value?: string; cells?: number }>(
       'setFormula',
       { range, formula, sheet },
       WpsAppType.SPREADSHEET
@@ -83,7 +83,7 @@ export const setFormulaHandler: ToolHandler = async (
         content: [
           {
             type: 'text',
-            text: `公式设置成功！\n单元格: ${range}\n公式: ${formula}\n计算结果: ${JSON.stringify(response.data)}`,
+            text: `公式设置成功！\n单元格: ${range}\n公式: ${formula}\n${response.data?.value !== undefined ? `首格结果: ${response.data.value}` : ''}${response.data?.cells && response.data.cells > 1 ? `（共 ${response.data.cells} 个单元格）` : ''}`,
           },
         ],
       };

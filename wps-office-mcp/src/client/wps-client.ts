@@ -175,6 +175,13 @@ async function execPowerShell(action: string, params: Record<string, unknown> = 
       // Output-Json 总是最后一行；COM 方法的返回值（如 True）可能泄漏到前面的行
       const result = parseLastJsonLine(stdout);
       if (result === undefined) {
+        // 脚本在 Output-Json 之前出错（如表名不存在导致后续表达式为空）时 stdout 无 JSON，报真实原因
+        const psErr = extractPsErrors(stderr);
+        if (psErr) {
+          log.error('PowerShell failed before output', { stderr: stderr.substring(0, 500), pid: ps.pid, action });
+          resolve({ success: false, error: `执行出错: ${psErr}` });
+          return;
+        }
         log.error('Failed to parse PowerShell output', { stdout: stdout.substring(0, 200), pid: ps.pid, action });
         reject(new Error(`PowerShell 输出解析失败（非有效JSON）: ${stdout.substring(0, 200)}`));
         return;

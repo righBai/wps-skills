@@ -577,8 +577,8 @@ export const addCommentHandler: ToolHandler = async (
   const { cell, comment } = args as { cell: string; comment: string };
   try {
     const response = await wpsClient.executeMethod<{ message: string }>(
-      'addComment',
-      { cell, comment },
+      'addCellComment',
+      { cell, text: comment },
       WpsAppType.SPREADSHEET
     );
     if (!response.success) {
@@ -615,8 +615,8 @@ export const protectSheetHandler: ToolHandler = async (
   const doProtect = protect !== false;
   try {
     const response = await wpsClient.executeMethod<{ message: string }>(
-      'protectSheet',
-      { password, protect: doProtect },
+      doProtect ? 'protectSheet' : 'unprotectSheet',
+      { password },
       WpsAppType.SPREADSHEET
     );
     if (!response.success) {
@@ -705,8 +705,8 @@ export const protectWorkbookHandler: ToolHandler = async (
   const { password, protect } = args as { password: string; protect: boolean };
   try {
     const response = await wpsClient.executeMethod<{ message: string }>(
-      'protectWorkbook',
-      { password, protect },
+      protect === false ? 'unprotectWorkbook' : 'protectWorkbook',
+      { password },
       WpsAppType.SPREADSHEET
     );
     if (!response.success) {
