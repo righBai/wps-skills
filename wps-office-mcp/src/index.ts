@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 /**
  * Input: 运行环境与启动参数
  * Output: MCP Server 导出与启动日志
