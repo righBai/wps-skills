@@ -10,10 +10,10 @@
       "homepage": "https://github.com/righBai/wps-skills",
       "categories": ["productivity"],
       "transport": "stdio",
-      "command": "npx",
-      "args": ["-y", "wps-office-mcp"],
-      "prerequisites": ["Node.js >= 18", "WPS Office（Windows）"],
-      "notes": "首次运行由 npx 拉包,稍等片刻"
+      "command": "cmd",
+      "args": ["/c", "npx", "-y", "wps-office-mcp"],
+      "prerequisites": ["Windows", "Node.js >= 18", "WPS Office"],
+      "notes": "首次运行由 npx 拉包,稍等片刻；经 cmd 启动是因为 Windows 上 npx 是 .cmd 脚本"
     }
   ]
 }
