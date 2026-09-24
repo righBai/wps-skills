@@ -17,6 +17,33 @@ AI编程助手通过自然语言操控WPS Office的MCP工具集。
 - Node.js >= 18.0.0
 - Git
 
+## 快速安装（Windows，免 git）
+
+MCP Server 已发布到 npm（[wps-office-mcp](https://www.npmjs.com/package/wps-office-mcp)），Skills 依赖它提供的工具，两者都要装。只需 WPS Office 与 Node.js >= 18。
+
+**1. 配置 MCP Server**
+
+通用配置（Windows 上 `npx` 是 `.cmd` 脚本，经 `cmd /c` 启动可兼容不走 shell 的客户端）：
+```json
+{
+  "mcpServers": {
+    "wps-office": {
+      "command": "cmd",
+      "args": ["/c", "npx", "-y", "wps-office-mcp"]
+    }
+  }
+}
+```
+
+- Claude Code：`claude mcp add wps-office -s user -- cmd /c npx -y wps-office-mcp`
+- PI-Desktop：MCP 市场 → 市场源 → 选「目录 JSON」，填 `https://raw.githubusercontent.com/righBai/wps-skills/main/mcp-catalog.json`，再在市场里安装 WPS Office
+
+**2. 安装 Skills**
+
+```bash
+npx skills add righBai/wps-skills
+```
+
 ## 自动安装（AI执行）
 
 以下步骤由AI助手自动执行。需要人类交互的步骤标注 ⚠️。
