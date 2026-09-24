@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-09-24",
+  "servers": [
+    {
+      "id": "wps-office",
+      "name": "WPS Office",
+      "description": "通过 PowerShell COM 操控 WPS 表格/文字/演示（需先本地克隆本仓库并编译 wps-office-mcp）",
+      "author": "righBai",
+      "homepage": "https://github.com/righBai/wps-skills",
+      "categories": ["productivity"],
+      "transport": "stdio",
+      "command": "node",
+      "args": ["${WPS_MCP_PATH}"],
+      "requiredEnv": [
+        {
+          "name": "WPS_MCP_PATH",
+          "description": "wps-office-mcp/dist/index.js 的绝对路径，例如 D:/project/wpsmcp/wps-office-mcp/dist/index.js"
+        }
+      ],
+      "prerequisites": ["Node.js >= 18", "WPS Office（Windows）", "在 wps-office-mcp 目录执行 npm install && npm run build"]
+    }
+  ]
+}
